@@ -10,7 +10,10 @@ from .sdxl import SDXLAdapter
 
 
 class SamplingContext(Protocol):
-    """Model-specific spatial state, created and closed once per invocation."""
+    """Spatial state owned by one invocation and closed on every exit.
+
+    Discover all pairs before finalizing preparation for the host sampler.
+    """
 
     def prepare_pair(
         self, positive: list[dict], negative: list[dict], region: TileRegion
@@ -20,6 +23,8 @@ class SamplingContext(Protocol):
 
 
 class LatentAdapter(Protocol):
+    """Stateless model semantics with invocation-owned spatial preparation."""
+
     def accepts(self, model) -> bool: ...
     def describe(self, model, latent) -> LatentSpec: ...
     def validate_sampling(self, model, latent, plan) -> None: ...

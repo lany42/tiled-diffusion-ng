@@ -36,7 +36,7 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.build-backend]
-source-include = ["__init__.py", ".python-version", "AGENTS.md", "PLAN.md", "uv.lock", "tests/**", "docs/**"]
+source-include = ["__init__.py", ".python-version", "AGENTS.md", "uv.lock", "tests/**", "docs/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

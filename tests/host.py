@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
 
-"""Small behavioral host doubles, written for this project.
+"""CPU contract doubles; these do not exercise ComfyUI inference.
 
-These exercise contracts, not ComfyUI inference. The actual source integration
-baseline and pending execution checks are recorded in docs/manual-validation.md.
+Source baselines and pending host checks: docs/comfyui-compatibility.md.
 """
 
 import copy

@@ -14,6 +14,8 @@ type HW = tuple[int, int]
 
 @dataclass(frozen=True)
 class GeometrySignature:
+    """Model geometry in latent cells, with pixel-per-cell scales."""
+
     adapter_id: str
     adapter_version: int
     latent_format: str
@@ -34,6 +36,8 @@ class LatentSpec:
 
 @dataclass(frozen=True)
 class TileRegion:
+    """Half-open (x0, y0, x1, y1) bounds in latent and pixel coordinates."""
+
     index: int
     tile_id: str
     core: Rect
@@ -44,6 +48,8 @@ class TileRegion:
 
 @dataclass(frozen=True)
 class TilePlanData:
+    """Immutable geometry with (H, W) pairs and requested overlap in pixels."""
+
     signature: GeometrySignature
     latent_hw: HW
     pixel_hw: HW

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
 
-"""Pinned ComfyUI compatibility boundary; everything here is invocation-local."""
+"""Shared ComfyUI orchestration with invocation-local sampling state."""
 
 import torch
 
@@ -250,6 +250,7 @@ def sample(
             )
         for name, cond in zip(TILE_IDS, local_positive, strict=True):
             validate_conditioning(cond, adapter, f"local_positive {name}")
+    # Locals replace each entire positive, including its controls.
     positives = [positive] * 4 if local_positive is None else local_positive
     context = adapter.create_sampling_context(tile_plan)
     evaluation = TileEvaluation(tile_plan, adapter)

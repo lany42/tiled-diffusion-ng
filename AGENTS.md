@@ -38,7 +38,7 @@ state, and V3 execution-list behavior when updating the compatibility baseline.
 Keep the offline CPU contract tests separate from evidence of real-host
 compatibility; their doubles cannot detect upstream changes by themselves.
 See [ComfyUI compatibility](docs/comfyui-compatibility.md) for inspected revisions,
-hint-sharing assumptions, the update watchlist, and the recheck record template.
+the contract matrix, hint-sharing assumptions, and pending host checks.
 
 Every Python source and test starts with:
 
