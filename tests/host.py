@@ -135,6 +135,16 @@ def identity_hint(x):
     return x
 
 
+def resize_hint(hint, width, height, algorithm, crop):
+    # Ordinary BCHW interpolation contract; no host imports or checkpoints.
+    h, w = hint.shape[-2:]
+    if crop == "center":
+        x = round((w - h * width / height) / 2) if w / h > width / height else 0
+        y = round((h - w * height / width) / 2) if w / h < width / height else 0
+        hint = hint[..., y : h - y, x : w - x]
+    return F.interpolate(hint, size=(height, width), mode=algorithm)
+
+
 class ControlNetwork:
     dims = 2
     in_channels = 4
@@ -169,6 +179,7 @@ class ControlNet:
         self.model_sampling_current = None
         self.cleanups = 0
         self.pre_runs = 0
+        self.hint_preparations = 0
 
     def copy(self):
         result = ControlNet(self.preprocess_image)
@@ -187,6 +198,7 @@ class ControlNet:
         return result
 
     def pre_run(self):
+        assert self.cond_hint_original is not None
         self.pre_runs += 1
         self.timestep_range = (
             1 - self.timestep_percent_range[0],
@@ -207,7 +219,28 @@ class ControlNet:
         if self.previous_controlnet:
             out += self.previous_controlnet.predict(x, sigma)
         if self.timestep_range[1] <= sigma.item() <= self.timestep_range[0]:
-            self.cond_hint = self.cond_hint_original.to(x)
+            pixel_hw = tuple(n * self.compression_ratio for n in x.shape[-2:])
+            if self.cond_hint is None or self.cond_hint.shape[-2:] != pixel_hw:
+                self.cond_hint = self.preprocess_image(
+                    resize_hint(
+                        self.cond_hint_original,
+                        pixel_hw[1],
+                        pixel_hw[0],
+                        self.upscale_algorithm,
+                        "center",
+                    )
+                ).to(x)
+                self.hint_preparations += 1
+            # A singleton broadcasts at the network; larger batches repeat or
+            # truncate. This double evaluates one conditioning branch at a time.
+            if self.cond_hint.shape[0] not in (1, x.shape[0]):
+                self.cond_hint = self.cond_hint.repeat(
+                    (x.shape[0] + self.cond_hint.shape[0] - 1)
+                    // self.cond_hint.shape[0],
+                    1,
+                    1,
+                    1,
+                )[: x.shape[0]]
             pixels = F.interpolate(
                 self.cond_hint.mean(1, keepdim=True),
                 size=x.shape[-2:],
@@ -252,6 +285,7 @@ class Host:
         self.latest_clone = None
         self.mutate_prepared = None
         self.option_update = None
+        self.live_options = None
 
         def module(name, **attrs):
             item = ModuleType(name)
@@ -276,7 +310,9 @@ class Host:
         )
         module(
             "comfy.patcher_extension",
-            WrappersMP=SimpleNamespace(CALC_COND_BATCH="calc_cond_batch"),
+            WrappersMP=SimpleNamespace(
+                CALC_COND_BATCH="calc_cond_batch", PREDICT_NOISE="predict_noise"
+            ),
         )
         self.samplers = module(
             "comfy.samplers",
@@ -333,15 +369,7 @@ class Host:
 
     def resize(self, hint, width, height, algorithm, crop):
         self.resize_calls.append((hint, width, height, algorithm, crop))
-        # Center-aspect crop followed by nearest-exact, sufficient for fixtures.
-        h, w = hint.shape[-2:]
-        if w / h > width / height:
-            new_w = round(h * width / height)
-            hint = hint[..., :, (w - new_w) // 2 : (w - new_w) // 2 + new_w]
-        elif w / h < width / height:
-            new_h = round(w * height / width)
-            hint = hint[..., (h - new_h) // 2 : (h - new_h) // 2 + new_h, :]
-        return F.interpolate(hint, size=(height, width), mode=algorithm)
+        return resize_hint(hint, width, height, algorithm, crop)
 
     @staticmethod
     def propagate(positives, negatives, field, fill):
@@ -435,18 +463,29 @@ class Host:
             self.mutate_prepared(branches)
         options = copy.deepcopy(model.model_options)
         options["transformer_options"]["wrappers"] = model.wrappers
+        self.live_options = options
         if self.option_update:
             self.option_update(options)
-        wrappers = [
-            wrapper
-            for group in model.wrappers.get("calc_cond_batch", {}).values()
-            for wrapper in group
-        ]
 
-        def continuation(index, *args):
-            if index == len(wrappers):
-                return self.leaf(*args)
-            return wrappers[index](lambda *a: continuation(index + 1, *a), *args)
+        def call_wrappers(kind, original, *args):
+            wrappers = [
+                wrapper
+                for group in model.wrappers.get(kind, {}).values()
+                for wrapper in group
+            ]
+
+            def continuation(index, *a, **kwargs):
+                if index == len(wrappers):
+                    return original(*a, **kwargs)
+                return wrappers[index](
+                    lambda *next_args, **next_kwargs: continuation(
+                        index + 1, *next_args, **next_kwargs
+                    ),
+                    *a,
+                    **kwargs,
+                )
+
+            return continuation(0, *args)
 
         x = latent["samples"].clone()
         batch_indices = latent.get("batch_index", list(range(x.shape[0])))
@@ -463,21 +502,39 @@ class Host:
         if denoise:
             x = x + noise * denoise
 
-            def evaluate(current_x, sigma, evaluation):
-                options["evaluation"] = evaluation
-                self.global_evaluations.append((current_x.clone(), sigma.clone()))
+            def predict_noise(current_x, sigma, model_options, seed):
                 uncond = (
                     None
-                    if cfg == 1 and not options.get("disable_cfg1_optimization")
+                    if cfg == 1 and not model_options.get("disable_cfg1_optimization")
                     else branches[1]
                 )
-                out = continuation(
-                    0, model.model, [branches[0], uncond], current_x, sigma, options
-                )
-                for fn in options.get("sampler_pre_cfg_function", []):
+                # The pinned host dispatches an override BEFORE calc_cond_batch.
+                # Tests must reproduce that bypass instead of routing overrides
+                # through the tiling continuation unconditionally.
+                if "sampler_calc_cond_batch_function" in model_options:
+                    out = model_options["sampler_calc_cond_batch_function"](
+                        {
+                            "conds": [branches[0], uncond],
+                            "input": current_x,
+                            "sigma": sigma,
+                            "model": model.model,
+                            "model_options": model_options,
+                        }
+                    )
+                else:
+                    out = call_wrappers(
+                        "calc_cond_batch",
+                        self.leaf,
+                        model.model,
+                        [branches[0], uncond],
+                        current_x,
+                        sigma,
+                        model_options,
+                    )
+                for fn in model_options.get("sampler_pre_cfg_function", []):
                     out = fn({"conds_out": out, "input": current_x})
                 result = out[1] + cfg * (out[0] - out[1])
-                for fn in options.get("sampler_post_cfg_function", []):
+                for fn in model_options.get("sampler_post_cfg_function", []):
                     result = fn(
                         {
                             "cond_denoised": out[0],
@@ -486,6 +543,15 @@ class Host:
                             "input": current_x,
                         }
                     )
+                return result
+
+            def evaluate(current_x, sigma, evaluation, model_options=None):
+                live = self.live_options if model_options is None else model_options
+                live["evaluation"] = evaluation
+                self.global_evaluations.append((current_x.clone(), sigma.clone()))
+                result = call_wrappers(
+                    "predict_noise", predict_noise, current_x, sigma, live, seed
+                )
                 if "noise_mask" in latent:
                     mask = latent["noise_mask"].reshape((-1, 1, *current_x.shape[-2:]))
                     result = result * mask + latent["samples"] * (1 - mask)

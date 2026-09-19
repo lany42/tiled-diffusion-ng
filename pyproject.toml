@@ -17,7 +17,12 @@ requires = ["uv_build>=0.12.13,<0.13.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
-dev = ["torch==2.14.0", "pytest>=9,<10", "ruff>=0.16.6"]
+dev = [
+    "torch==2.14.0",
+    "pytest>=9,<10",
+    "ruff>=0.16.6",
+    "numpy>=2.5.3",
+]
 
 [tool.uv]
 python-preference = "system"

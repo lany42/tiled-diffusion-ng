@@ -6,6 +6,7 @@
 import torch
 
 from ..geometry import GeometrySignature, LatentSpec, validate_plan
+from ._sdxl_sampling import SDXLSamplingContext
 
 
 class SDXLAdapter:
@@ -105,7 +106,15 @@ class SDXLAdapter:
                 "Unsupported SDXL model_sampling conversion; expected native EPS or V_PREDICTION"
             )
 
-    def validate_condition(self, metadata):
+    def validate_condition(self, embedding, metadata):
+        if (
+            not isinstance(embedding, torch.Tensor)
+            or embedding.ndim != 3
+            or embedding.numel() == 0
+        ):
+            raise ValueError(
+                "SDXL CONDITIONING requires a nonempty rank-3 embedding tensor"
+            )
         known = {
             "pooled_output",
             "cross_attn_controlnet",
@@ -129,6 +138,18 @@ class SDXLAdapter:
         for key in metadata:
             if key not in known:
                 raise ValueError(f"Unsupported SDXL conditioning field: {key}")
+
+    def validate_evaluation(self, samples, plan):
+        if (
+            not isinstance(samples, torch.Tensor)
+            or samples.ndim != plan.signature.rank
+            or samples.shape[1] != plan.signature.channels
+            or tuple(samples.shape[-2:]) != plan.latent_hw
+        ):
+            raise ValueError("SDXL model evaluation canvas does not match TILE_PLAN")
+
+    def create_sampling_context(self, plan):
+        return SDXLSamplingContext(plan)
 
     def adapt_spatial_condition(self, condition, region):
         # SDXL text/y conditions have no spatial crop; explicit size values and

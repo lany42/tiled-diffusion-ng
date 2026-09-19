@@ -3,9 +3,6 @@
 
 """Pinned ComfyUI compatibility boundary; everything here is invocation-local."""
 
-import inspect
-import logging
-
 import torch
 
 from .adapters import resolve_adapter
@@ -14,7 +11,6 @@ from .geometry import TILE_IDS, crop
 
 TAG = "tdng_tile_id"
 WRAPPER_KEY = "tiled_diffusion_ng.v1"
-logger = logging.getLogger(__name__)
 
 
 def validate_registrations(sampler_name, scheduler):
@@ -37,8 +33,12 @@ def validate_registrations(sampler_name, scheduler):
 
 
 def validate_options(options, *, allow_tiled=False):
+    if "sampler_calc_cond_batch_function" in options:
+        raise ValueError(
+            "Unsupported model option: sampler_calc_cond_batch_function "
+            "replaces ComfyUI conditioning evaluation and bypasses tiling"
+        )
     for key in (
-        "sampler_calc_cond_batch_function",
         "context_handler",
         "model_function_wrapper",
         "multigpu_clones",
@@ -48,10 +48,20 @@ def validate_options(options, *, allow_tiled=False):
     transformer = options.get("transformer_options", {})
     if transformer.get("context_handler") is not None:
         raise ValueError("Unsupported transformer context_handler")
-    if not allow_tiled and transformer.get("wrappers", {}).get(
-        "calc_cond_batch", {}
-    ).get(WRAPPER_KEY):
-        raise ValueError("Model is already tiled by Tiled Diffusion NG")
+    if not allow_tiled:
+        for kind in ("calc_cond_batch", "predict_noise"):
+            if transformer.get("wrappers", {}).get(kind, {}).get(WRAPPER_KEY):
+                raise ValueError("Model is already tiled by Tiled Diffusion NG")
+
+
+def guard_prediction(executor, x, timestep, model_options, seed=None):
+    # Native samplers can change these options after common_ksampler starts.
+    # Guard the live prediction call BEFORE sampling_function dispatches its
+    # optional override, which otherwise skips CALC_COND_BATCH and our wrapper.
+    # https://github.com/Comfy-Org/ComfyUI/blob/3c80da7f87ee359b2d06f107cb3c0797079dfbbb/comfy/samplers.py#L609-L623
+    # https://github.com/Comfy-Org/ComfyUI/blob/3c80da7f87ee359b2d06f107cb3c0797079dfbbb/comfy/samplers.py#L1210-L1218
+    validate_options(model_options, allow_tiled=True)
+    return executor(x, timestep, model_options, seed)
 
 
 def validate_conditioning(conditioning, adapter, label):
@@ -61,151 +71,21 @@ def validate_conditioning(conditioning, adapter, label):
         if (
             not isinstance(entry, (list, tuple))
             or len(entry) != 2
-            or not isinstance(entry[0], torch.Tensor)
-            or entry[0].ndim != 3
-            or entry[0].numel() == 0
             or not isinstance(entry[1], dict)
         ):
             raise ValueError(
                 f"{label} has invalid CONDITIONING nesting; expected [embedding, metadata] entries"
             )
-        adapter.validate_condition(entry[1])
+        adapter.validate_condition(entry[0], entry[1])
 
 
-class ControlCopies:
-    def __init__(self, plan):
-        self.plan = plan
-        self.controls = []
-        self.normalized = {}
-
-    def clone(self, original, region, memo, visiting):
-        from comfy import controlnet, utils
-        from comfy.cldm.cldm import ControlNet as ControlNetwork
-
-        if original is None:
-            return None
-        key = id(original)
-        if key in visiting:
-            raise ValueError("Cyclic previous_controlnet chain")
-        if key in memo:
-            return memo[key]
-        if (
-            type(original) is not controlnet.ControlNet
-            or type(original.control_model) is not ControlNetwork
-        ):
-            raise ValueError(
-                "Unsupported control: only ordinary SDXL image-hint ControlNet is supported"
-            )
-        network = original.control_model
-        if hasattr(network, "num_control_type"):
-            raise ValueError("Unsupported ControlNet capability: Union control types")
-        # Ordinary SDXL controls use sequential ADM with 2816 inputs. Checking
-        # architecture attributes does not load or inspect parameter values.
-        # https://github.com/Comfy-Org/ComfyUI/blob/3c80da7f87ee359b2d06f107cb3c0797079dfbbb/comfy/cldm/cldm.py#L119-L186
-        if (
-            network.dims != 2
-            or network.in_channels != 4
-            or network.num_classes != "sequential"
-            or network.label_emb[0][0].in_features != 2816
-            or network.input_hint_block[0].in_channels != 3
-        ):
-            raise ValueError(
-                "ControlNet architecture is incompatible with standard SDXL RGB hints"
-            )
-        for field in (
-            "vae",
-            "latent_format",
-            "concat_mask",
-            "extra_concat_orig",
-            "extra_hooks",
-            "multigpu_clones",
-        ):
-            if getattr(original, field, None):
-                raise ValueError(f"Unsupported ControlNet capability: {field}")
-        if original.compression_ratio != 8 or set(original.extra_conds) - {"y"}:
-            raise ValueError("Unsupported ControlNet compression_ratio/extra_conds")
-        default_preprocess = (
-            inspect.signature(controlnet.ControlNet)
-            .parameters["preprocess_image"]
-            .default
-        )
-        if original.preprocess_image is not default_preprocess:
-            raise ValueError(
-                "Unsupported ControlNet preprocess_image; requires an explicit full-canvas handler"
-            )
-        if any(
-            not isinstance(value, (str, int, float, bool, type(None)))
-            for value in original.extra_args.values()
-        ):
-            raise ValueError("Unsupported ControlNet spatial extra_args")
-        hint = original.cond_hint_original
-        if (
-            not isinstance(hint, torch.Tensor)
-            or hint.ndim != 4
-            or hint.shape[1] != 3
-            or min(hint.shape) < 1
-        ):
-            raise ValueError(
-                "ControlNet hint must be a nonempty BCHW RGB tensor in full-canvas coordinates"
-            )
-
-        visiting.add(key)
-        clone = original.copy()
-        if clone is original:
-            raise ValueError("ControlNet.copy() must return an independent control")
-        self.controls.append(clone)
-        memo[key] = clone
-        clone.previous_controlnet = None
-        clone.cond_hint = None
-        clone.timestep_range = None
-        clone.extra_concat = None
-        clone.model_sampling_current = None
-        # Hints are BCHW. Host center-resize to full pixel dimensions FIRST,
-        # then use the identical pixel rectangles used by TileView.
-        # https://github.com/Comfy-Org/ComfyUI/blob/3c80da7f87ee359b2d06f107cb3c0797079dfbbb/comfy/controlnet.py#L269-L303
-        # Coordinate comparison: https://github.com/shiimizu/ComfyUI-TiledDiffusion/blob/a155b1bac39147381aeaa52b9be42e545626a44f/tiled_diffusion.py#L330-L447
-        hint_key = (id(hint), original.upscale_algorithm)
-        if hint_key not in self.normalized:
-            ph, pw = self.plan.pixel_hw
-            self.normalized[hint_key] = utils.common_upscale(
-                hint, pw, ph, original.upscale_algorithm, "center"
-            )
-        clone.cond_hint_original = crop(
-            self.normalized[hint_key], region.pixel_sampling
-        ).clone()
-        clone.previous_controlnet = self.clone(
-            original.previous_controlnet, region, memo, visiting
-        )
-        visiting.remove(key)
-        return clone
-
-    def close(self):
-        # Sever clone-only chains before cleanup to visit each clone exactly once.
-        # Host cleanup is idempotent; its success path may have run already.
-        for control in self.controls:
-            control.previous_controlnet = None
-        for control in self.controls:
-            try:
-                control.cleanup()
-            except Exception:
-                logger.exception("Tiled Diffusion NG ControlNet cleanup failed")
-            finally:
-                control.cond_hint_original = None
-                control.cond_hint = None
-                control.extra_concat = None
-                control.model_sampling_current = None
-        self.controls.clear()
-        self.normalized.clear()
-        self.plan = None
-
-
-def prepare_pairs(positives, negative, plan, controls):
+def prepare_pairs(positives, negative, plan, context):
     from comfy import samplers
 
     positive_out, negative_out = [], []
     for region, positive in zip(plan.regions, positives, strict=True):
         # The helper consumes dicts. Keep each embedding under a temporary key,
-        # so duplicate negative entries retain the helper's exact pairing rules.
+        # so replaced negative entries retain their original embeddings.
         p = [dict(meta, tdng_embedding=embedding) for embedding, meta in positive]
         n = [dict(meta, tdng_embedding=embedding) for embedding, meta in negative]
         # Resolve before flattening, never across tiles. The host will prepare
@@ -217,14 +97,10 @@ def prepare_pairs(positives, negative, plan, controls):
             "control",
             lambda found, index: found[index],
         )
-        memo = {}
+        p, n = context.prepare_pair(p, n, region)
         for entries, out in ((p, positive_out), (n, negative_out)):
             for meta in entries:
                 embedding = meta.pop("tdng_embedding")
-                if meta.get("control") is not None:
-                    meta["control"] = controls.clone(
-                        meta["control"], region, memo, set()
-                    )
                 meta["control_apply_to_uncond"] = False
                 meta[TAG] = region.tile_id
                 out.append([embedding, meta])
@@ -243,12 +119,7 @@ class TileEvaluation:
         if self.plan is None:
             raise RuntimeError("Tiled sampling invocation has already closed")
         validate_options(model_options, allow_tiled=True)
-        if (
-            x_in.ndim != self.plan.signature.rank
-            or x_in.shape[1] != self.plan.signature.channels
-            or tuple(x_in.shape[-2:]) != self.plan.latent_hw
-        ):
-            raise ValueError("Model evaluation canvas does not match TILE_PLAN")
+        self.adapter.validate_evaluation(x_in, self.plan)
         for branch in conds:
             if branch is not None:
                 if not branch or any(
@@ -363,11 +234,12 @@ def sample(
     adapter.validate_sampling(model, latent_image, tile_plan)
     validate_registrations(sampler_name, scheduler)
     validate_options(model.model_options)
-    if model.get_wrappers(WrappersMP.CALC_COND_BATCH, WRAPPER_KEY):
+    wrapper_types = (WrappersMP.PREDICT_NOISE, WrappersMP.CALC_COND_BATCH)
+    if any(model.get_wrappers(kind, WRAPPER_KEY) for kind in wrapper_types):
         raise ValueError("Model is already tiled by Tiled Diffusion NG")
     if getattr(model, "additional_models", {}).get("multigpu"):
         raise ValueError(
-            "Multi-device model clones are outside the supported SDXL path"
+            "Multi-device model clones are outside the supported tiled sampling path"
         )
     validate_conditioning(positive, adapter, "positive")
     validate_conditioning(negative, adapter, "negative")
@@ -379,12 +251,16 @@ def sample(
         for name, cond in zip(TILE_IDS, local_positive, strict=True):
             validate_conditioning(cond, adapter, f"local_positive {name}")
     positives = [positive] * 4 if local_positive is None else local_positive
-    controls = ControlCopies(tile_plan)
+    context = adapter.create_sampling_context(tile_plan)
     evaluation = TileEvaluation(tile_plan, adapter)
     clone = None
     try:
-        positives, negatives = prepare_pairs(positives, negative, tile_plan, controls)
+        positives, negatives = prepare_pairs(positives, negative, tile_plan, context)
+        context.finalize_preparation()
         clone = model.clone()
+        clone.add_wrapper_with_key(
+            WrappersMP.PREDICT_NOISE, WRAPPER_KEY, guard_prediction
+        )
         clone.add_wrapper_with_key(WrappersMP.CALC_COND_BATCH, WRAPPER_KEY, evaluation)
         # Live lookup preserves extensions' dispatch. Noise/masks/batch indices,
         # schedules, callbacks, solver state and LATENT metadata stay host-owned.
@@ -403,6 +279,9 @@ def sample(
         )[0]
     finally:
         evaluation.close()
-        controls.close()
-        if clone is not None:
-            _detach(clone, WrappersMP.CALC_COND_BATCH)
+        try:
+            context.close()
+        finally:
+            if clone is not None:
+                for kind in wrapper_types:
+                    _detach(clone, kind)

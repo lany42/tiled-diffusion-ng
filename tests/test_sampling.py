@@ -53,6 +53,7 @@ def test_one_global_sampler_multiple_evaluations_full_canvas_defaults_and_immuta
     assert output["note"] == "keep me"
     assert args["model"].wrappers == {}
     assert not host.latest_clone.get_wrappers("calc_cond_batch", sampling.WRAPPER_KEY)
+    assert not host.latest_clone.get_wrappers("predict_noise", sampling.WRAPPER_KEY)
     for before_entry, after_entry in zip(before, args["positive"]):
         torch.testing.assert_close(before_entry[0], after_entry[0])
         assert before_entry[1].keys() == after_entry[1].keys()
@@ -395,6 +396,7 @@ def test_cleanup_on_failures_and_repeated_stages(host, failure):
     with pytest.raises((RuntimeError, InterruptedError, ValueError)):
         sampling.sample(**args)
     assert not host.latest_clone.get_wrappers("calc_cond_batch", sampling.WRAPPER_KEY)
+    assert not host.latest_clone.get_wrappers("predict_noise", sampling.WRAPPER_KEY)
     assert all(
         c.cond_hint_original is None and c.cond_hint is None for c in host.discovered
     )
@@ -447,3 +449,85 @@ def test_sampler_starts_denominator_validation_before_first_tile(host, monkeypat
     with pytest.raises(ValueError, match="positive everywhere"):
         sampling.sample(**arguments())
     assert not host.tile_calls
+
+
+@pytest.mark.parametrize("after_first_evaluation", [False, True])
+@pytest.mark.parametrize("replace_options", [False, True])
+def test_native_sampler_late_override_fails_before_untiled_forward(
+    host, after_first_evaluation, replace_options
+):
+    override_calls = []
+    control = ControlNet()
+    args = arguments(positive=cond(1, control=control), sampler_name="late_override")
+    host.samplers.KSampler.SAMPLERS.append("late_override")
+
+    def override(call):
+        override_calls.append(call)
+        return [call["input"], call["input"]]
+
+    def registered_sampler(evaluate, x, sigmas):
+        sigma = torch.tensor([sigmas[0]], dtype=x.dtype)
+        if after_first_evaluation:
+            x = evaluate(x, sigma, (0, 0))
+        live = host.live_options.copy() if replace_options else host.live_options
+        live["sampler_calc_cond_batch_function"] = override
+        return evaluate(x, sigma, (0, 1), model_options=live)
+
+    host.dispatch["late_override"] = SimpleNamespace(
+        sampler_function=registered_sampler
+    )
+    with pytest.raises(
+        ValueError, match="sampler_calc_cond_batch_function.*bypasses tiling"
+    ):
+        sampling.sample(**args)
+    assert not override_calls
+    assert len(host.tile_calls) == (4 if after_first_evaluation else 0)
+    assert args["model"].wrappers == {}
+    assert "sampler_calc_cond_batch_function" not in args["model"].model_options
+    for kind in ("predict_noise", "calc_cond_batch"):
+        assert not host.latest_clone.get_wrappers(kind, sampling.WRAPPER_KEY)
+    assert all(
+        c.cond_hint_original is None and c.cond_hint is None for c in host.discovered
+    )
+    assert control.cond_hint_original is not None
+
+
+def test_prediction_guard_preserves_wrappers_live_options_and_seed(host):
+    args = arguments()
+    seen = []
+
+    def outer(executor, x, timestep, model_options, seed):
+        seen.append((tuple(x.shape), seed))
+        return executor(
+            x, timestep, {**model_options, "prediction_wrapper": True}, seed
+        )
+
+    def inner(executor, model, conds, x, timestep, model_options):
+        assert model_options["prediction_wrapper"] is True
+        return executor(model, conds, x, timestep, model_options)
+
+    args["model"].add_wrapper_with_key("predict_noise", "other", outer)
+    args["model"].add_wrapper_with_key("calc_cond_batch", "other", inner)
+    sampling.sample(**args)
+    assert seen == [((1, 4, 13, 17), 123)] * 6
+    assert host.latest_clone.get_wrappers("predict_noise", "other") == [outer]
+    assert host.latest_clone.get_wrappers("calc_cond_batch", "other") == [inner]
+    assert len(host.tile_calls) == 24
+
+
+def test_override_installed_by_outer_prediction_wrapper_is_rejected(host):
+    args = arguments()
+    called = []
+
+    def outer(executor, x, timestep, model_options, seed):
+        live = {
+            **model_options,
+            "sampler_calc_cond_batch_function": lambda args: called.append(args),
+        }
+        return executor(x, timestep, live, seed)
+
+    args["model"].add_wrapper_with_key("predict_noise", "other", outer)
+    with pytest.raises(ValueError, match="sampler_calc_cond_batch_function"):
+        sampling.sample(**args)
+    assert not called and not host.tile_calls
+    assert host.latest_clone.get_wrappers("predict_noise", "other") == [outer]
