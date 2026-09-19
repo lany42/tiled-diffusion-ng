@@ -18,7 +18,7 @@ class TilePlan(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="TiledDiffusionNG_TilePlan",
-            display_name="Prepare Four Tile Plan",
+            display_name="TilePlan",
             category=CATEGORY,
             inputs=[
                 io.Model.Input("model"),
@@ -46,7 +46,7 @@ class TileView(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="TiledDiffusionNG_TileView",
-            display_name="Extract Four Vision Views",
+            display_name="TileView",
             category=CATEGORY,
             inputs=[io.Image.Input("image"), PLAN.Input("tile_plan")],
             outputs=[io.Image.Output("tiles")],
@@ -67,7 +67,7 @@ class TileSampler(io.ComfyNode):
         # https://github.com/Comfy-Org/ComfyUI/blob/3c80da7f87ee359b2d06f107cb3c0797079dfbbb/comfy_api/latest/_io.py#L2239-L2250
         return io.Schema(
             node_id="TiledDiffusionNG_TileSampler",
-            display_name="Sample Four Tiles",
+            display_name="TileSampler",
             category=CATEGORY,
             is_input_list=True,
             inputs=[

@@ -18,9 +18,9 @@ pending. See [compatibility](docs/comfyui-compatibility.md) and
 
 | Display name | Node ID | Inputs → output |
 | --- | --- | --- |
-| Prepare Four Tile Plan | `TiledDiffusionNG_TilePlan` | `model`, `latent`, `tile_overlap` → TILE_PLAN |
-| Extract Four Vision Views | `TiledDiffusionNG_TileView` | `image`, `tile_plan` → IMAGE batch |
-| Sample Four Tiles | `TiledDiffusionNG_TileSampler` | KSampler inputs, `tile_plan`, optional `local_positive` → LATENT |
+| TilePlan | `TiledDiffusionNG_TilePlan` | `model`, `latent`, `tile_overlap` → TILE_PLAN |
+| TileView | `TiledDiffusionNG_TileView` | `image`, `tile_plan` → IMAGE batch |
+| TileSampler | `TiledDiffusionNG_TileSampler` | KSampler inputs, `tile_plan`, optional `local_positive` → LATENT |
 
 ## Workflow
 
@@ -31,7 +31,7 @@ at every model evaluation.
 
 ```mermaid
 flowchart LR
-    A[Model and Latent] --> B[Tile Plan] --> C["Tile View (optional)"] --> D[TileSampler]
+    A[Model and Latent] --> B[TilePlan] --> C["TileView (optional)"] --> D[TileSampler]
 ```
 
 Vision views are optional and require a reference image matching the plan's full
