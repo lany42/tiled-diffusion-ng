@@ -1,0 +1,20 @@
+tiled-diffusion-ng
+
+Project implementation:
+Copyright (c) 2026 Lany Atwood <lany@colorized.life>
+GNU Affero General Public License, version 3 only (AGPL-3.0-only).
+See LICENSE.
+
+Original algorithm reference:
+Álvaro Barbero Jiménez, Mixture of Diffusers for scene composition and high
+resolution image generation, arXiv:2302.02412v1, §§3.1–3.2, equations 15–16.
+https://arxiv.org/html/2302.02412v1#S3
+Author implementation (MIT), revision af42292d0a8cb414f6da2eeac79be4c60afbbe48:
+https://github.com/albarji/mixture-of-diffusers/tree/af42292d0a8cb414f6da2eeac79be4c60afbbe48
+The Gaussian and fusion implementation is independently written from the equations.
+
+Inspiration:
+shiimizu's ComfyUI-TiledDiffusion, revision
+a155b1bac39147381aeaa52b9be42e545626a44f:
+https://github.com/shiimizu/ComfyUI-TiledDiffusion/tree/a155b1bac39147381aeaa52b9be42e545626a44f
+No source code from that project is included here.

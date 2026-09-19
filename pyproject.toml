@@ -1,17 +1,49 @@
 [project]
 name = "tiled-diffusion-ng"
 version = "0.1.0"
-description = "Add your description here"
+description = "Four-view Mixture of Diffusers sampling for SDXL in ComfyUI."
 readme = "README.md"
 authors = [
     { name = "Lany Atwood", email = "lany@colorized.life" }
 ]
 requires-python = ">=3.13"
+# ComfyUI owns PyTorch and comfy_api, including its configured CUDA build.
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "COPYRIGHT"]
 dependencies = []
-
-[project.scripts]
-tiled-diffusion-ng = "tiled_diffusion_ng:main"
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["torch==2.14.0", "pytest>=9,<10", "ruff>=0.16.6"]
+
+[tool.uv]
+python-preference = "system"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.build-backend]
+source-include = ["__init__.py", ".python-version", "AGENTS.md", "PLAN.md", "uv.lock", "tests/**", "docs/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["--import-mode=importlib", "--confcutdir=tests"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.per-file-ignores]
+"./__init__.py" = ["N999"]
