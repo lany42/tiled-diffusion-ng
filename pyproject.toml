@@ -1,0 +1,17 @@
+[project]
+name = "tiled-diffusion-ng"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Lany Atwood", email = "lany@colorized.life" }
+]
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+tiled-diffusion-ng = "tiled_diffusion_ng:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
