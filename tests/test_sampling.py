@@ -418,14 +418,20 @@ def test_cleanup_on_failures_and_repeated_stages(host, failure):
     "field,value",
     [
         ("vae", object()),
+        ("latent_format", object()),
         ("concat_mask", True),
+        ("extra_concat_orig", [torch.ones(1, 1, 16, 16)]),
+        ("extra_hooks", object()),
+        ("multigpu_clones", {"other_device": object()}),
         ("preprocess_image", lambda x: x * 2),
+        ("compression_ratio", 4),
         ("extra_conds", ["image"]),
         ("extra_args", {"spatial": torch.ones(2, 2)}),
     ],
 )
-def test_control_capability_errors_before_host_sampling(host, field, value):
-    control = ControlNet()
+@pytest.mark.parametrize("union", [False, True])
+def test_control_capability_errors_before_host_sampling(host, union, field, value):
+    control = ControlNet(union=union)
     setattr(control, field, value)
     with pytest.raises(ValueError, match=field):
         sampling.sample(**arguments(positive=cond(1, control=control)))

@@ -149,14 +149,16 @@ class ControlNetwork:
     in_channels = 4
     num_classes = "sequential"
 
-    def __init__(self):
+    def __init__(self, *, union=False):
         self.label_emb = [[SimpleNamespace(in_features=2816)]]
         self.input_hint_block = [SimpleNamespace(in_channels=3)]
+        if union:
+            self.num_control_type = 8
 
 
 class ControlNet:
-    def __init__(self, preprocess_image=identity_hint):
-        self.control_model = ControlNetwork()
+    def __init__(self, preprocess_image=identity_hint, *, union=False):
+        self.control_model = ControlNetwork(union=union)
         self.control_model_wrapped = object()
         self.cond_hint_original = torch.zeros(1, 3, 16, 16)
         self.cond_hint = None

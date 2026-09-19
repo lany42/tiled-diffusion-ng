@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from tiled_diffusion_ng import _comfy_sampling as sampling
+from tiled_diffusion_ng.adapters import _native_control as native
 from tiled_diffusion_ng.adapters import _sdxl_sampling as sdxl
 from tiled_diffusion_ng.adapters import resolve_adapter
 from tiled_diffusion_ng.geometry import crop, make_plan
@@ -18,8 +19,8 @@ from .host import ControlNet, cond, resize_hint
 from .test_sampling import arguments
 
 
-def control_with_hint(hint, algorithm="nearest-exact"):
-    control = ControlNet()
+def control_with_hint(hint, algorithm="nearest-exact", *, union=False):
+    control = ControlNet(union=union)
     control.cond_hint_original = hint
     control.upscale_algorithm = algorithm
     return control
@@ -188,15 +189,15 @@ def test_source_view_and_resize_configurations_remain_distinct(host):
             torch.testing.assert_close(
                 clone.cond_hint_original, expected, rtol=0, atol=0
             )
-        key = sdxl._hint_key(hints[0], "nearest-exact", "center", plan.pixel_hw)
-        assert key == sdxl._hint_key(
+        key = native._hint_key(hints[0], "nearest-exact", "center", plan.pixel_hw)
+        assert key == native._hint_key(
             hints[0].view_as(hints[0]), "nearest-exact", "center", plan.pixel_hw
         )
-        assert key != sdxl._hint_key(
+        assert key != native._hint_key(
             hints[0], "nearest-exact", "disabled", plan.pixel_hw
         )
-        assert key != sdxl._hint_key(hints[0], "nearest-exact", "center", (64, 48))
-        assert key != sdxl._hint_key(
+        assert key != native._hint_key(hints[0], "nearest-exact", "center", (64, 48))
+        assert key != native._hint_key(
             torch._neg_view(hints[0]), "nearest-exact", "center", plan.pixel_hw
         )
     finally:
@@ -252,8 +253,9 @@ def test_discovery_pins_source_until_materialization_then_releases_it(
 
 @pytest.mark.parametrize("scenario", ["global", "aliased_locals", "distinct_locals"])
 @pytest.mark.parametrize("hint_batch", [1, 2, 4])
+@pytest.mark.parametrize("union", [False, True])
 def test_sampling_matches_copy_reference_without_repreparing_caches(
-    host, monkeypatch, scenario, hint_batch
+    host, monkeypatch, scenario, hint_batch, union
 ):
     source = torch.rand(
         hint_batch, 3, 17, 29, generator=torch.Generator().manual_seed(8)
@@ -265,7 +267,9 @@ def test_sampling_matches_copy_reference_without_repreparing_caches(
             source + i / 10 if scenario == "distinct_locals" else source.view_as(source)
         )
         first = control_with_hint(hint)
-        second = control_with_hint(hint.view_as(hint))
+        second = control_with_hint(hint.view_as(hint), union=union)
+        if union:
+            second.extra_args["control_type"] = [6 if i % 2 else 1]
         first.previous_controlnet = second
         first.strength = 0.8
         second.strength = -0.4
@@ -318,7 +322,7 @@ def test_sampling_matches_copy_reference_without_repreparing_caches(
             for control in controls:
                 control.cond_hint_original = crop(normalized, rect).clone()
 
-    monkeypatch.setattr(sdxl._HintGroup, "materialize", normalize_then_copy)
+    monkeypatch.setattr(native._HintGroup, "materialize", normalize_then_copy)
     host.mutate_prepared = None
     expected = sampling.sample(**args)["samples"]
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -339,12 +343,18 @@ def test_sampling_matches_copy_reference_without_repreparing_caches(
 @pytest.mark.parametrize(
     "failure", [None, "normalize", "crop", "host_prepare", "model", "cancel"]
 )
+@pytest.mark.parametrize("union", [False, True])
 def test_groups_do_not_accumulate_canvases_and_cleanup_releases_hints(
-    host, monkeypatch, failure
+    host, monkeypatch, failure, union
 ):
     from comfy import utils
 
-    controls = [control_with_hint(torch.rand(1, 3, 17, 29)) for _ in range(4)]
+    controls = [
+        control_with_hint(torch.rand(1, 3, 17, 29), union=union) for _ in range(4)
+    ]
+    if union:
+        for i, control in enumerate(controls):
+            control.extra_args["control_type"] = [i]
     args = arguments(
         hw=(6, 8), local_positive=[cond(i, control=c) for i, c in enumerate(controls)]
     )
@@ -387,7 +397,7 @@ def test_groups_do_not_accumulate_canvases_and_cleanup_releases_hints(
     monkeypatch.setattr(adapter, "create_sampling_context", create_context)
     monkeypatch.setattr(utils, "common_upscale", normalize)
     if failure == "crop":
-        monkeypatch.setattr(sdxl, "crop", failing_crop)
+        monkeypatch.setattr(native, "crop", failing_crop)
     elif failure == "host_prepare":
         host.mutate_prepared = fail_preparation
     elif failure == "model":
