@@ -20,6 +20,7 @@ class TilePlan(io.ComfyNode):
             node_id="TiledDiffusionNG_TilePlan",
             display_name="TilePlan",
             category=CATEGORY,
+            description="Four views for SDXL or native Anima (Base, Aesthetic, Turbo, 2.9B). Anima requires canvas dimensions divisible by 16 pixels; overlap rounds to aligned views without padding.",
             inputs=[
                 io.Model.Input("model"),
                 io.Latent.Input("latent"),
@@ -48,6 +49,7 @@ class TileView(io.ComfyNode):
             node_id="TiledDiffusionNG_TileView",
             display_name="TileView",
             category=CATEGORY,
+            description="Crop the plan's overlap-inclusive sampling rectangles from an image at the exact canvas size. Returns one IMAGE batch: image 0 TL/TR/BR/BL, then image 1 TL/TR/BR/BL, and so on.",
             inputs=[io.Image.Input("image"), PLAN.Input("tile_plan")],
             outputs=[io.Image.Output("tiles")],
         )
@@ -69,6 +71,7 @@ class TileSampler(io.ComfyNode):
             node_id="TiledDiffusionNG_TileSampler",
             display_name="TileSampler",
             category=CATEGORY,
+            description="One native trajectory for SDXL or Anima images. Anima accepts 4D or single-frame 5D latents and returns 5D. Anima controls are unsupported; LLLite is deferred. Choose sampling settings for your checkpoint, including CFG 1 for Turbo when appropriate.",
             is_input_list=True,
             inputs=[
                 io.Model.Input("model"),
@@ -93,7 +96,7 @@ class TileSampler(io.ComfyNode):
                 io.Conditioning.Input(
                     "local_positive",
                     optional=True,
-                    tooltip="Execution list of four complete positives: TL, TR, BR, BL. Each replaces the entire global positive, including its controls. Attach controls to locals when needed; use a list producer, not ConditioningCombine.",
+                    tooltip="Four complete positives in execution-list order: TL, TR, BR, BL. Each replaces the global positive, including SDXL controls. Attach controls to SDXL locals when needed. Use a list producer, not ConditioningCombine.",
                 ),
             ],
             outputs=[io.Latent.Output("latent")],

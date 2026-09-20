@@ -7,6 +7,7 @@ Source baselines and pending host checks: docs/comfyui-compatibility.md.
 """
 
 import copy
+import math
 import sys
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
@@ -68,11 +69,113 @@ def cond(value, **metadata):
     ]
 
 
+def reshape_mask(mask, shape):
+    # Native 5D preparation treats a sub-5D mask's leading axes as time,
+    # interpolates that axis, then repeats the result across the image batch.
+    # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/utils.py#L1350-L1369
+    if len(shape) == 4:
+        mask = mask.reshape(-1, 1, *mask.shape[-2:])
+        mode = "bilinear"
+    else:
+        if mask.ndim < 5:
+            mask = mask.reshape(1, 1, -1, *mask.shape[-2:])
+        mode = "trilinear"
+    mask = F.interpolate(mask, size=shape[2:], mode=mode)
+    if mask.shape[1] < shape[1]:
+        mask = mask.repeat((1, shape[1]) + (1,) * (len(shape) - 2))[:, : shape[1]]
+    return mask.repeat(
+        (math.ceil(shape[0] / mask.shape[0]),) + (1,) * (len(shape) - 1)
+    )[: shape[0]]
+
+
+def copy_containers(value):
+    # ModelPatcher clones list/dict containers, preserving tensor and callable
+    # identities. deepcopy would hide mutations to graph-owned patch objects.
+    # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/model_patcher.py#L449-L483
+    if isinstance(value, dict):
+        return {key: copy_containers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [copy_containers(item) for item in value]
+    return value
+
+
 class SDXLFormat:
     latent_channels = 4
     latent_dimensions = 2
     spacial_downscale_ratio = 8
     temporal_downscale_ratio = 1
+
+
+class Wan21Format:
+    latent_channels = 16
+    latent_dimensions = 3
+    spacial_downscale_ratio = 8
+    temporal_downscale_ratio = 4
+
+
+class CONST:
+    def calculate_input(self, sigma, x):
+        return x
+
+    def calculate_denoised(self, sigma, prediction, x):
+        return x - sigma.reshape((-1,) + (1,) * (x.ndim - 1)) * prediction
+
+
+class VideoRopePosition3DEmb:
+    pass
+
+
+class AnimaNetwork:
+    in_channels = out_channels = 16
+    patch_spatial = 2
+    patch_temporal = 1
+    pos_emb_cls = "rope3d"
+    extra_per_block_abs_pos_emb = False
+    concat_padding_mask = True
+    rope_h_extrapolation_ratio = rope_w_extrapolation_ratio = 4.0
+    rope_t_extrapolation_ratio = 1.0
+
+    def __init__(self, num_blocks):
+        self.num_blocks = num_blocks
+        self.pos_embedder = VideoRopePosition3DEmb()
+        self.text_calls = []
+
+    def preprocess_text_embeds(self, embedding, ids, t5xxl_weights=None):
+        # Distinct, small deterministic text math, not an LLM adapter substitute.
+        # Preserve native token weighting, padding and preparation ownership.
+        self.text_calls.append((embedding, ids, t5xxl_weights))
+        output = embedding.mean(1, keepdim=True) + ids.unsqueeze(-1) * 0.01
+        if t5xxl_weights is not None:
+            output = output * t5xxl_weights
+        return F.pad(output, (0, 0, 0, max(0, 512 - output.shape[1])))
+
+
+class Anima:
+    def __init__(self, num_blocks=28):
+        self.diffusion_model = AnimaNetwork(num_blocks)
+        self.model_config = SimpleNamespace(
+            unet_config={"image_model": "anima", "num_blocks": num_blocks}
+        )
+        self.concat_keys = ()
+        self.condition_calls = []
+
+    def extra_conds(self, **kwargs):
+        # Inference prepares text once; the non-inference native path carries
+        # ids/weights into forward. These contracts deliberately use no host code.
+        # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/model_base.py#L1482-L1505
+        self.condition_calls.append(kwargs)
+        embedding = kwargs["cross_attn"]
+        prepared = {}
+        if kwargs.get("t5xxl_ids") is not None:
+            ids = kwargs["t5xxl_ids"].unsqueeze(0)
+            weights = kwargs["t5xxl_weights"].unsqueeze(0).unsqueeze(-1).to(embedding)
+            if torch.is_inference_mode_enabled():
+                embedding = self.diffusion_model.preprocess_text_embeds(
+                    embedding, ids, weights
+                )
+            else:
+                prepared.update(t5xxl_ids=ids, t5xxl_weights=weights)
+        return dict(prepared, c_crossattn=embedding)
 
 
 class EPS:
@@ -99,25 +202,41 @@ class SDXL:
 
 
 class Model:
-    def __init__(self):
-        self.model = SDXL()
-        self.format = SDXLFormat()
-        self.sampling = EPS()
+    def __init__(self, family="sdxl", *, num_blocks=28):
+        self.model = SDXL() if family == "sdxl" else Anima(num_blocks)
+        self.format = SDXLFormat() if family == "sdxl" else Wan21Format()
+        self.sampling = EPS() if family == "sdxl" else CONST()
         self.model_options = {"transformer_options": {}}
         self.wrappers = {}
         self.additional_models = {}
-        self.patches = {"lora": object()}
+        self.attachments = {}
+        self.patches = {"lora": [object()]}
 
     def get_model_object(self, name):
+        if name == "diffusion_model":
+            return self.model.diffusion_model
         return {"latent_format": self.format, "model_sampling": self.sampling}[name]
 
     def clone(self):
         result = copy.copy(self)
-        result.model_options = copy.deepcopy(self.model_options)
+        result.model_options = copy_containers(self.model_options)
+        result.patches = copy_containers(self.patches)
+        result.attachments = self.attachments.copy()
+        result.additional_models = {
+            key: [model.clone() for model in models]
+            for key, models in self.additional_models.items()
+        }
         result.wrappers = {
             kind: {key: list(items) for key, items in groups.items()}
             for kind, groups in self.wrappers.items()
         }
+        return result
+
+    def get_nested_additional_models(self):
+        result = []
+        for models in self.additional_models.values():
+            for model in models:
+                result.extend([model, *model.get_nested_additional_models()])
         return result
 
     def add_wrapper_with_key(self, kind, key, wrapper):
@@ -287,6 +406,9 @@ class Host:
         self.mutate_prepared = None
         self.option_update = None
         self.live_options = None
+        self.defer_anima_text = False
+        self.native_calls = []
+        self.discovered_models = []
 
         def module(name, **attrs):
             item = ModuleType(name)
@@ -298,9 +420,17 @@ class Host:
             return item
 
         module("comfy")
-        module("comfy.model_base", SDXL=SDXL)
-        module("comfy.latent_formats", SDXL=SDXLFormat)
-        module("comfy.model_sampling", EPS=EPS, V_PREDICTION=VPrediction)
+        module("comfy.model_base", SDXL=SDXL, Anima=Anima)
+        module("comfy.latent_formats", SDXL=SDXLFormat, Wan21=Wan21Format)
+        module("comfy.model_sampling", EPS=EPS, V_PREDICTION=VPrediction, CONST=CONST)
+        module("comfy.ldm")
+        module("comfy.ldm.anima")
+        module("comfy.ldm.anima.model", Anima=AnimaNetwork)
+        module("comfy.ldm.cosmos")
+        module(
+            "comfy.ldm.cosmos.position_embedding",
+            VideoRopePosition3DEmb=VideoRopePosition3DEmb,
+        )
         module("comfy.controlnet", ControlNet=ControlNet)
         module("comfy.cldm")
         module("comfy.cldm.cldm", ControlNet=ControlNetwork)
@@ -312,7 +442,10 @@ class Host:
         module(
             "comfy.patcher_extension",
             WrappersMP=SimpleNamespace(
-                CALC_COND_BATCH="calc_cond_batch", PREDICT_NOISE="predict_noise"
+                CALC_COND_BATCH="calc_cond_batch",
+                PREDICT_NOISE="predict_noise",
+                APPLY_MODEL="apply_model",
+                DIFFUSION_MODEL="diffusion_model",
             ),
         )
         self.samplers = module(
@@ -395,11 +528,28 @@ class Host:
             active = []
             for entry in branch or []:
                 if (
-                    entry.get("timestep_start", 1.0) < sigma
-                    or entry.get("timestep_end", 0.0) > sigma
+                    entry.get("timestep_start", 1.0) < sigma[0]
+                    or entry.get("timestep_end", 0.0) > sigma[0]
                 ):
                     continue
                 prediction = x * 0.25 + entry["cross_attn"].mean().to(x)
+                if isinstance(model, Anima):
+                    # Native conditional evaluation forwards the live sigma in
+                    # transformer options and leaves prediction conversion in
+                    # BaseModel. Neither responsibility belongs to the adapter.
+                    # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L309-L334
+                    transformer = copy_containers(options["transformer_options"])
+                    transformer["sigmas"] = sigma
+                    prediction = self.call_wrappers(
+                        transformer,
+                        "apply_model",
+                        self.anima_apply_model,
+                        model,
+                        x,
+                        sigma,
+                        entry["model_conds"],
+                        transformer,
+                    )
                 if entry.get("control") is not None:
                     prediction = prediction + entry["control"].predict(x, sigma)
                 active.append((prediction, entry.get("strength", 1.0)))
@@ -410,6 +560,53 @@ class Host:
             else:
                 outputs.append(torch.zeros_like(x))
         return outputs
+
+    @staticmethod
+    def call_wrappers(options, kind, original, *args):
+        wrappers = [
+            wrapper
+            for group in options.get("wrappers", {}).get(kind, {}).values()
+            for wrapper in group
+        ]
+
+        def continuation(index, *a, **kwargs):
+            if index == len(wrappers):
+                return original(*a, **kwargs)
+            return wrappers[index](
+                lambda *next_args, **next_kwargs: continuation(
+                    index + 1, *next_args, **next_kwargs
+                ),
+                *a,
+                **kwargs,
+            )
+
+        return continuation(0, *args)
+
+    def anima_apply_model(self, model, x, sigma, conditions, transformer):
+        native_sampling = self.latest_clone.sampling
+        model_input = native_sampling.calculate_input(sigma, x)
+        prediction = self.call_wrappers(
+            transformer,
+            "diffusion_model",
+            self.anima_forward,
+            model,
+            model_input,
+            sigma,
+            conditions,
+            transformer,
+        )
+        # BaseModel converts the native prediction to float32 before denoising.
+        # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/model_base.py#L251-L255
+        return native_sampling.calculate_denoised(sigma, prediction.float(), x)
+
+    def anima_forward(self, model, x, sigma, conditions, transformer):
+        self.native_calls.append((x.clone(), sigma.clone(), transformer))
+        embedding = conditions["c_crossattn"]
+        if "t5xxl_ids" in conditions:
+            embedding = model.diffusion_model.preprocess_text_embeds(
+                embedding, conditions["t5xxl_ids"], conditions["t5xxl_weights"]
+            )
+        return x * 0.25 + embedding.mean().to(x)
 
     def common_ksampler(
         self,
@@ -425,6 +622,7 @@ class Host:
         denoise=1.0,
     ):
         self.latest_clone = model
+        self.discovered_models.extend(model.get_nested_additional_models())
         self.common_calls.append(
             {
                 "seed": seed,
@@ -443,16 +641,26 @@ class Host:
             prepared = []
             for embedding, metadata in raw:
                 item = dict(metadata, cross_attn=embedding)
-                item["model_conds"] = {
-                    "c_crossattn": embedding,
-                    "y": (
-                        metadata.get("width", latent["samples"].shape[-1] * 8),
-                        metadata.get("height", latent["samples"].shape[-2] * 8),
-                    ),
-                }
-                item["timestep_start"] = 1 - metadata.get("start_percent", 0)
-                item["timestep_end"] = 1 - metadata.get("end_percent", 1)
-                if metadata.get("control") is not None:
+                if isinstance(model.model, Anima):
+                    with torch.inference_mode(not self.defer_anima_text):
+                        item["model_conds"] = model.model.extra_conds(**item)
+                else:
+                    item["model_conds"] = {
+                        "c_crossattn": embedding,
+                        "y": (
+                            metadata.get("width", latent["samples"].shape[-1] * 8),
+                            metadata.get("height", latent["samples"].shape[-2] * 8),
+                        ),
+                    }
+                # Percent settings override explicit timesteps when present.
+                # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L859-L882
+                if "start_percent" in metadata:
+                    item["timestep_start"] = 1 - metadata["start_percent"]
+                if "end_percent" in metadata:
+                    item["timestep_end"] = 1 - metadata["end_percent"]
+                # Native hook discovery checks key presence, including None.
+                # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/sampler_helpers.py#L31-L50
+                if "control" in metadata:
                     control = metadata["control"]
                     if control not in self.discovered:
                         self.discovered.append(control)
@@ -462,33 +670,16 @@ class Host:
         self.prepared = branches
         if self.mutate_prepared:
             self.mutate_prepared(branches)
-        options = copy.deepcopy(model.model_options)
+        options = copy_containers(model.model_options)
         options["transformer_options"]["wrappers"] = model.wrappers
         self.live_options = options
         if self.option_update:
             self.option_update(options)
 
-        def call_wrappers(kind, original, *args):
-            wrappers = [
-                wrapper
-                for group in model.wrappers.get(kind, {}).values()
-                for wrapper in group
-            ]
-
-            def continuation(index, *a, **kwargs):
-                if index == len(wrappers):
-                    return original(*a, **kwargs)
-                return wrappers[index](
-                    lambda *next_args, **next_kwargs: continuation(
-                        index + 1, *next_args, **next_kwargs
-                    ),
-                    *a,
-                    **kwargs,
-                )
-
-            return continuation(0, *args)
-
         x = latent["samples"].clone()
+        if model.format.latent_dimensions == 3 and x.ndim == 4:
+            x = x.unsqueeze(2)
+        original_x = x.clone()
         batch_indices = latent.get("batch_index", list(range(x.shape[0])))
         noise = torch.cat(
             [
@@ -523,7 +714,8 @@ class Host:
                         }
                     )
                 else:
-                    out = call_wrappers(
+                    out = self.call_wrappers(
+                        model_options["transformer_options"],
                         "calc_cond_batch",
                         self.leaf,
                         model.model,
@@ -534,7 +726,21 @@ class Host:
                     )
                 for fn in model_options.get("sampler_pre_cfg_function", []):
                     out = fn({"conds_out": out, "input": current_x})
-                result = out[1] + cfg * (out[0] - out[1])
+                if "sampler_cfg_function" in model_options:
+                    result = current_x - model_options["sampler_cfg_function"](
+                        {
+                            "cond": current_x - out[0],
+                            "uncond": current_x - out[1],
+                            "cond_denoised": out[0],
+                            "uncond_denoised": out[1],
+                            "cond_scale": cfg,
+                            "input": current_x,
+                            "sigma": sigma,
+                            "model_options": model_options,
+                        }
+                    )
+                else:
+                    result = out[1] + cfg * (out[0] - out[1])
                 for fn in model_options.get("sampler_post_cfg_function", []):
                     result = fn(
                         {
@@ -550,18 +756,32 @@ class Host:
                 live = self.live_options if model_options is None else model_options
                 live["evaluation"] = evaluation
                 self.global_evaluations.append((current_x.clone(), sigma.clone()))
-                result = call_wrappers(
-                    "predict_noise", predict_noise, current_x, sigma, live, seed
+                # PREDICT_NOISE comes from guider-owned options, even when a
+                # sampler replaces the options passed to this prediction call.
+                # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L1210-L1218
+                result = self.call_wrappers(
+                    {"wrappers": model.wrappers},
+                    "predict_noise",
+                    predict_noise,
+                    current_x,
+                    sigma,
+                    live,
+                    seed,
                 )
-                if "noise_mask" in latent:
-                    mask = latent["noise_mask"].reshape((-1, 1, *current_x.shape[-2:]))
-                    result = result * mask + latent["samples"] * (1 - mask)
+                if latent.get("noise_mask") is not None:
+                    mask = reshape_mask(latent["noise_mask"], current_x.shape)
+                    result = result * mask + original_x * (1 - mask)
                 return result
 
             sigmas = self.samplers.SCHEDULER_HANDLERS[scheduler].handler(steps, denoise)
             x = self.samplers.sampler_object(sampler_name).sampler_function(
                 evaluate, x, sigmas
             )
+            if isinstance(model.model, Anima):
+                # Native output conversion is host-owned, independent of the
+                # input/model precision. Wan21 scaling itself is not simulated.
+                # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L1237-L1238
+                x = x.float()
         for control in self.discovered:
             control.cleanup()
         result = dict(latent, samples=x)

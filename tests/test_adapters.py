@@ -33,6 +33,9 @@ def test_shared_evaluation_delegates_embedding_and_layout_semantics(host):
     validations = []
 
     class Adapter:
+        def validate_model_options(self, options):
+            validations.append("options")
+
         def validate_condition(self, embedding, metadata):
             assert embedding == {"tokens": (1, 2)}
             validations.append("embedding")
@@ -59,7 +62,7 @@ def test_shared_evaluation_delegates_embedding_and_layout_semantics(host):
     finally:
         evaluation.close()
     torch.testing.assert_close(output[0], x * 0.5 + 2)
-    assert validations == ["embedding", "layout"]
+    assert validations == ["embedding", "options", "layout"]
     assert regions == ["TL", "TR", "BR", "BL"]
 
 

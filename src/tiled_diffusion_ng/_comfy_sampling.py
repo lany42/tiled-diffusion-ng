@@ -54,16 +54,6 @@ def validate_options(options, *, allow_tiled=False):
                 raise ValueError("Model is already tiled by Tiled Diffusion NG")
 
 
-def guard_prediction(executor, x, timestep, model_options, seed=None):
-    # Native samplers can change these options after common_ksampler starts.
-    # Guard the live prediction call BEFORE sampling_function dispatches its
-    # optional override, which otherwise skips CALC_COND_BATCH and our wrapper.
-    # https://github.com/Comfy-Org/ComfyUI/blob/3c80da7f87ee359b2d06f107cb3c0797079dfbbb/comfy/samplers.py#L609-L623
-    # https://github.com/Comfy-Org/ComfyUI/blob/3c80da7f87ee359b2d06f107cb3c0797079dfbbb/comfy/samplers.py#L1210-L1218
-    validate_options(model_options, allow_tiled=True)
-    return executor(x, timestep, model_options, seed)
-
-
 def validate_conditioning(conditioning, adapter, label):
     if not isinstance(conditioning, (list, tuple)) or not conditioning:
         raise ValueError(f"{label} must be a complete, nonempty CONDITIONING")
@@ -113,12 +103,35 @@ class TileEvaluation:
         self.adapter = adapter
         self.weights = {}
 
+    def guard_prediction(self, executor, x, timestep, model_options, seed=None):
+        if self.plan is None:
+            raise RuntimeError("Tiled sampling invocation has already closed")
+        # PREDICT_NOISE uses guider-owned options, while CALC_COND_BATCH reads
+        # the sampler's live options. Reject replacements that lose this exact
+        # invocation's evaluation, or native dispatch would silently skip tiling.
+        # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L209-L222
+        # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L609-L632
+        # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L1210-L1218
+        validate_options(model_options, allow_tiled=True)
+        wrappers = (
+            model_options.get("transformer_options", {})
+            .get("wrappers", {})
+            .get("calc_cond_batch", {})
+            .get(WRAPPER_KEY, [])
+        )
+        if len(wrappers) != 1 or wrappers[0] is not self:
+            raise ValueError(
+                "Live model options removed or replaced the tiled conditioning wrapper"
+            )
+        return executor(x, timestep, model_options, seed)
+
     def __call__(self, executor, model, conds, x_in, timestep, model_options):
         from comfy import model_management
 
         if self.plan is None:
             raise RuntimeError("Tiled sampling invocation has already closed")
         validate_options(model_options, allow_tiled=True)
+        self.adapter.validate_model_options(model_options)
         self.adapter.validate_evaluation(x_in, self.plan)
         for branch in conds:
             if branch is not None:
@@ -234,6 +247,7 @@ def sample(
     adapter.validate_sampling(model, latent_image, tile_plan)
     validate_registrations(sampler_name, scheduler)
     validate_options(model.model_options)
+    adapter.validate_model_options(model.model_options)
     wrapper_types = (WrappersMP.PREDICT_NOISE, WrappersMP.CALC_COND_BATCH)
     if any(model.get_wrappers(kind, WRAPPER_KEY) for kind in wrapper_types):
         raise ValueError("Model is already tiled by Tiled Diffusion NG")
@@ -260,7 +274,7 @@ def sample(
         context.finalize_preparation()
         clone = model.clone()
         clone.add_wrapper_with_key(
-            WrappersMP.PREDICT_NOISE, WRAPPER_KEY, guard_prediction
+            WrappersMP.PREDICT_NOISE, WRAPPER_KEY, evaluation.guard_prediction
         )
         clone.add_wrapper_with_key(WrappersMP.CALC_COND_BATCH, WRAPPER_KEY, evaluation)
         # Live lookup preserves extensions' dispatch. Noise/masks/batch indices,

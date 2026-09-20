@@ -106,6 +106,10 @@ class SDXLAdapter:
                 "Unsupported SDXL model_sampling conversion; expected native EPS or V_PREDICTION"
             )
 
+    def validate_model_options(self, options):
+        # Shared option guards retain the existing SDXL patch behavior.
+        pass
+
     def validate_condition(self, embedding, metadata):
         if (
             not isinstance(embedding, torch.Tensor)

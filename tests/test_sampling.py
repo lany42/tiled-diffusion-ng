@@ -48,7 +48,7 @@ def test_one_global_sampler_multiple_evaluations_full_canvas_defaults_and_immuta
     assert len(host.tile_calls) == 24
     assert host.common_calls[0]["latent"] is args["latent_image"]
     assert host.latest_clone is not args["model"]
-    assert host.latest_clone.patches is args["model"].patches
+    assert host.latest_clone.patches["lora"][0] is args["model"].patches["lora"][0]
     assert output["samples"].shape == (1, 4, 13, 17)
     assert output["note"] == "keep me"
     assert args["model"].wrappers == {}
@@ -537,3 +537,44 @@ def test_override_installed_by_outer_prediction_wrapper_is_rejected(host):
         sampling.sample(**args)
     assert not called and not host.tile_calls
     assert host.latest_clone.get_wrappers("predict_noise", "other") == [outer]
+
+
+@pytest.mark.parametrize("family", ["sdxl", "anima"])
+@pytest.mark.parametrize("replacement", ["missing", "foreign", "duplicate"])
+def test_live_options_cannot_remove_or_replace_this_invocations_tiling(
+    host, family, replacement
+):
+    from .test_anima import arguments as anima_arguments
+
+    args = (arguments if family == "sdxl" else anima_arguments)(steps=1)
+
+    def solver(evaluate, x, sigmas):
+        x = evaluate(x, torch.tensor([0.6]), (0, 0))
+        wrappers = host.live_options["transformer_options"]["wrappers"]
+        own = wrappers["calc_cond_batch"][sampling.WRAPPER_KEY]
+        entries = {
+            "missing": [],
+            "foreign": [lambda executor, *a: executor(*a)],
+            "duplicate": own * 2,
+        }[replacement]
+        live = {
+            **host.live_options,
+            "transformer_options": {
+                **host.live_options["transformer_options"],
+                "wrappers": {
+                    **wrappers,
+                    "calc_cond_batch": {sampling.WRAPPER_KEY: entries},
+                },
+            },
+        }
+        return evaluate(x, torch.tensor([0.4]), (0, 1), live)
+
+    host.dispatch["euler"].sampler_function = solver
+    with pytest.raises(
+        ValueError, match="removed or replaced.*tiled conditioning wrapper"
+    ):
+        sampling.sample(**args)
+    assert len(host.tile_calls) == 4
+    for kind in ("predict_noise", "calc_cond_batch"):
+        assert not host.latest_clone.get_wrappers(kind, sampling.WRAPPER_KEY)
+    assert not args["model"].wrappers

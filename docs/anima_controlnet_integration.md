@@ -1,49 +1,62 @@
 # Tiled Anima LLLite integration plan
 
-Status: proposed implementation, not a compatibility claim. This note records
-the design discussion on 2026-09-19 so work can resume after basic Anima support
-lands. It authorizes no change to the existing sampling contract by itself.
+Status: LLLite remains proposed and unimplemented. Updated on 2026-09-19 after
+reviewing the base Anima implementation and ComfyUI source at
+[`944386c233e02eaf877b1c8d5d513fb3d3a4d5e3`][anima-host]. Source inspection and
+offline contracts are separate from real-host acceptance, which remains pending.
 
 ## Preconditions and assumptions about Anima support
 
-This integration assumes the node pack already supports ordinary Anima image
-sampling. At the time of this design discussion, the checked-in adapter registry
-still contains SDXL alone. Implement and validate the following prerequisites
-before adding LLLite support:
+The [Anima adapter](../src/tiled_diffusion_ng/adapters/anima.py) now supplies
+the base sampling contract through the existing TilePlan, TileView and
+TileSampler nodes. Preserve these established choices when adding LLLite:
 
-- **Explicit model adapter:** recognize supported Anima models by their required
-  APIs and semantics. Keep architecture-specific validation and preparation out
-  of the shared geometry and fusion implementation.
-- **Latent layout:** establish the actual stored LATENT layout and model-call
-  layout, including 16-channel latent handling and the singleton temporal axis
-  expected by the inspected native LLLite path. Admit image sampling with T=1;
-  do not imply video or temporal tiling support.
-- **Geometry:** establish latent-to-pixel scale, transformer patch alignment,
-  minimum extents, and padding rules. TilePlan, TileView, and the model evaluation
-  must agree on overlap-inclusive sampling rectangles. Resolve odd dimensions
-  and padding without silently stretching the spatial reference.
-- **Positions:** choose and validate the positional-coordinate policy for tiled
-  Anima evaluations. LLLite integration must use that established policy rather
-  than introducing a separate one.
-- **Prediction semantics:** validate Anima's native flow/prediction conversion
-  and its compatibility with prediction fusion. Do not reuse SDXL EPS/V checks
-  merely by relaxing their rejection conditions.
-- **Conditioning:** preserve Anima text preparation and support global positive,
-  global negative, and four complete local positives in TL/TR/BR/BL order.
-- **Trajectory ownership:** retain one `common_ksampler` call, one full-canvas
-  latent trajectory, and native solver history. All tile views in an evaluation
-  read the same current latent and sigma. Fuse branch predictions before the
-  host applies compatible global CFG behavior.
-- **Patch routing:** preserve compatible MODEL patches through cloning and
-  native evaluation. Verify native post-input, attention, and MLP hook routing,
-  live model options, sigma propagation, and auxiliary-model discovery.
-- **Lifecycle:** leave caller inputs usable and release invocation-owned state
-  on success, failure, and cancellation. Anima support must not depend on a
-  sibling host checkout or GPU for its offline contract tests.
+- **Family:** native Anima with Wan21 metadata: 16 latent channels, three latent
+  dimensions, spatial scale 8 and temporal scale 4. One adapter covers Base,
+  Aesthetic, Turbo and 2.9B; [host detection][anima-detection] reads transformer
+  depth from weights. This does not establish LLLite compatibility across depths.
+- **Layout:** floating, nonempty `B×16×H×W` and `B×16×1×H×W` inputs share a
+  canonical `BCTHW` plan signature. [Native sampling][anima-sample] introduces the
+  singleton temporal axis and returns 5D. Video and structured spatial LATENT
+  metadata are rejected. Output dtype and Wan21 normalization remain host-owned;
+  the [sampled output path][anima-samplers] converts to float32 before undoing
+  latent normalization. Do not require the input dtype to survive sampling.
+- **Geometry:** signature `anima`, adapter version 1, scale `(8, 8)`, alignment
+  `(2, 2)` and minimum extent `(2, 2)` in latent cells. Canvas dimensions must be
+  divisible by 16 pixels. Origins and extents of sampling rectangles are aligned;
+  impossible four-view geometry fails without resizing or padding. TILE_PLAN
+  remains schema 1; preserve its complete value, including overlap-inclusive
+  `pixel_sampling` rectangles, as the future attachment's plan identity.
+- **Positions and predictions:** retain native tile-local RoPE and extrapolation
+  settings, without extra absolute positions or global offsets. Require native
+  `CONST` input and denoised conversion, `denoised = x - sigma * prediction`.
+  Conversion stays in the host; fuse denoised branches before global CFG.
+- **Text:** preserve embeddings, T5 IDs/weights, attention-mask and pooled
+  metadata, strength and timestep settings. [Anima extra_conds][anima-base]
+  preprocesses text during inference; its other path passes IDs/weights into
+  forward. Metadata preservation does not imply every field is consumed by the
+  backbone. Keep global positive/negative and four complete local positives in
+  TL/TR/BR/BL order, with text preparation owned by the host.
+- **Routing and lifetime:** one `common_ksampler` call owns the full trajectory,
+  masks, batch indices and solver history. All tiles read the same current latent
+  and sigma. Preserve native continuations, live options, ordinary weight LoRAs,
+  compatible wrappers, optimized attention and global CFG hooks. Invocation
+  context and fusion state close on success, failure and cancellation.
 
-The existing [model adapter research](model-adapter-research.md) is a starting
-point. Its inspected revisions and CPU doubles do not establish real-host Anima
-compatibility. Record real-host evidence separately.
+Current guards deliberately reject non-`None` conditioning controls with
+`ValueError`: the native Anima transformer does not consume UNet ControlNet
+residuals. Recognized native AnimaLLLite hooks raise `NotImplementedError` for
+deferred tiled routing; other transformer patches/replacements raise `ValueError`.
+Recognition is validation only, including when strength is zero. Future LLLite
+support must admit only its validated attachment/hook set through these guards.
+
+[Offline tests](../tests/test_anima.py) cover the base contracts, including
+28/40-layer configurations, live options and cleanup. They neither execute
+native LLLite hooks nor establish checkpoint or visual compatibility. Base,
+Aesthetic, Turbo and 2.9B each still require real-host generation/refinement,
+portrait/landscape, local-prompt, LoRA and seam acceptance with recorded revisions
+and settings. The [adapter research](model-adapter-research.md) is background,
+not a substitute for that evidence.
 
 ## Initial objective and scope
 
@@ -174,6 +187,11 @@ flattened batch. At sampling time, require B to equal the latent image batch, or
 explicitly support B=1 broadcast. Do not introduce arbitrary repetition rules.
 Host conditional/unconditional batching is a separate dimension of evaluation
 that must retain native semantics after selecting the tile's source batch.
+The [native LLLite module][anima-lllite] repeats the whole reference batch when
+the model batch is a multiple of it. This matches concatenated conditioning
+batches; it is not per-image `repeat_interleave`. Test multiple conditioning
+entries and separate/combined positive-negative calls, including CFG 1's omitted
+negative branch. Do not rely on divisibility alone to validate source mapping.
 
 A plain IMAGE tensor does not carry provenance. Matching shape and count cannot
 prove it came from the specified TileView. Document the ordering contract and
@@ -188,31 +206,54 @@ classes while specializing input preparation and reference selection. Copy only
 what is necessary; inspect licensing and preserve required attribution before
 copying upstream implementation text.
 
-Inspected native behavior relevant to this design:
+The pinned [apply node][anima-apply] clones MODEL and installs `post_input`,
+`attn1_patch`, `attn2_patch` and `mlp_patch`. Its input hook derives reference size
+from the received latent and handles optional four-channel inpainting masks.
+The following source contracts constrain the specialization:
 
-- The apply node clones MODEL and installs post-input, self-attention,
-  cross-attention, and MLP patches.
-- Its image preparation derives target dimensions from the received latent.
-- Native mask handling is conditioning for four-channel inpainting checkpoints.
-- The host supplies per-forward patch data and invokes post-input hooks after
-  latent padding.
+- **Hook data:** [native forward][anima-backbone] calls post-input hooks after
+  latent padding and embedding. `x` is the padded `BCTHW` latent; `img` is the
+  embedded `BTHWD` sequence. The host creates a fresh `model_patch_data` dictionary
+  whenever post-input patches are present. Put invocation/tile dispatch in a
+  separate namespaced transformer option; it would be overwritten in
+  `model_patch_data`. The native input hook keys prepared embeddings by its own
+  object, and the attention/MLP hooks must reference that same object.
+- **Hook targets:** self-attention hooks modify Q/K/V inputs before projection;
+  cross-attention modifies only Q, whose tokens follow the image grid. Text K/V
+  have a different sequence length. The MLP hook runs before `mlp.layer1`.
+  Preserve these native routes rather than replacing forward.
+- **Checkpoint coverage:** the native loader admits named-key v2 LLLite weights.
+  Validate RGB `cond_in_channels == 3`, `model_dim` against the actual backbone,
+  and every targeted block index. `block_count` is the highest referenced index
+  plus one, not proof of complete coverage: `apply` silently skips absent
+  modules. Decide and validate supported sparse coverage explicitly; loading a
+  checkpoint alone does not establish compatibility with a 28- or 40-layer model.
+- **Activation:** the apply node converts percentages with `percent_to_sigma`.
+  The input hook uses the inclusive range `sigma_end <= max(sigmas) <= sigma_start`
+  for the whole forward, not a separate gate for each image. Preserve and test
+  that behavior with mixed sigmas and repeated solver evaluations. Preparation
+  must account for changes to MODEL sampling settings after patch application,
+  rather than silently using stale thresholds. Require tiled dispatch before
+  returning early for zero strength or an inactive window.
+- **Discovery and ownership:** [ModelPatcher cloning][anima-patcher] copies
+  option containers while preserving hook objects; attachments are shared unless
+  they implement `on_model_patcher_clone`. The input hook's `models()` exposes
+  MODEL_PATCH through [model_patches_models()][anima-patch-discovery] to
+  [native loading][anima-loading].
+  Install that discovery route before `common_ksampler`; adding it only during a
+  tile evaluation is too late. Explicit `additional_models` discovery in the
+  current CPU doubles does not test this patch-owned loading route.
 
 Passing our entire TileView batch straight into the unmodified native node does
 not implement routing. It is interpreted as an image batch, not four spatial
 regions. Passing a full reference unchanged to each tile instead would fit the
 whole reference into each tile. Neither is the intended spatial operation.
 
-Use these upstream source locations when resuming:
-
-- [Native apply node and loader](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_model_patch.py)
-- [Anima LLLite implementation](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/anima/lllite.py)
-- [Host forward and patch routing](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/cosmos/predict2.py)
-- [Node documentation](https://docs.comfy.org/built-in-nodes/AnimaLLLiteApply)
-
-These are moving source links from the discussion, not a pinned compatibility
-baseline. Reinspect and record an exact revision before implementation. The
-documentation is secondary to the code. Do not infer compatibility with the
-Kohya custom node: its wrapper-based integration is a separate implementation.
+Reinspect these pinned contracts when changing the host baseline; the revision
+is evidence, not an exact-version runtime requirement. The
+[node documentation](https://docs.comfy.org/built-in-nodes/AnimaLLLiteApply) is
+secondary to the code. Do not infer compatibility with the Kohya custom node:
+its wrapper-based integration is a separate implementation.
 
 ## MODEL attachment and automatic sampler behavior
 
@@ -243,7 +284,11 @@ patched by tiles" behavior without creating a second sampler or solver path.
 Current SamplingContext handles conditioning pairs and does not receive MODEL
 or per-tile model options. Extend that contract deliberately, or introduce a
 small adjacent spatial-patch preparation interface. Keep the shared loop free
-of Anima-specific tensor preparation. The implementation should support:
+of Anima-specific tensor preparation. `validate_model_options` already runs
+before host sampling and at each tiled conditional evaluation. The existing
+per-region continuation is the insertion point for tile options; the base
+implementation intentionally has no attachment schema, dispatch API or cache.
+The LLLite implementation should support:
 
 1. Validating and preparing recognized MODEL patches for one invocation.
 2. Producing per-tile options or dispatch context before calling the existing
@@ -268,6 +313,14 @@ For each native conditional evaluation:
 5. Native attention/MLP hooks consume the selected conditioning.
 6. Fuse predictions using the existing weights, then return full-canvas branches
    to native CFG and solver execution.
+
+The host resolves PREDICT_NOISE wrappers from guider-owned options and
+CALC_COND_BATCH wrappers from the sampler's live options. Preserve the exact
+invocation's tiled conditional wrapper in any per-tile copy. The prediction
+guard now rejects removed, replaced or duplicate tiled wrappers before native
+dispatch; otherwise replacement live options could silently bypass tiling and
+its patch validation. Re-entering the outer conditional evaluator would also
+re-enter tiling, so call only the supplied continuation.
 
 Do not switch four arbitrary MODEL objects inside one host trajectory. Retain
 one model configuration with tile-aware spatial patch dispatch. Avoid mutating
@@ -294,12 +347,16 @@ network evaluates them. Do not claim equivalence to encoding the full canvas
 and cropping its embeddings; the native encoder's normalization and optional
 global pooling make that a different computation.
 
-Resolve padded tile dimensions explicitly with the Anima adapter. A reference
-crop corresponds to the actual sampling rectangle, not an enlarged rectangle
-invented by resizing to padded dimensions. Either constrain initial geometry to
-validated aligned sizes or define and test matching reference padding. Reject
-unsupported cases rather than silently distort coordinates. The precise padding
-policy is an implementation gate, not settled by this note.
+The base adapter has selected aligned geometry. With temporal patch size 1,
+spatial patch size 2 and T=1, every evaluated tile already fits the native patch
+grid, so transformer padding adds no image area. A reference crop must match
+`pixel_sampling` exactly. The native encoder's two stride-4 convolutions produce
+one token per 16×16 pixels, matching one Anima token per 2×2 latent cells. Check
+that token count explicitly; do not resize a malformed reference to make it fit.
+Retain native RGB clamping and normalization when specializing preparation.
+The backbone's separate zero padding-mask channel does not enlarge the rectangle.
+Supporting unaligned geometry later would change this contract and require a
+new adapter policy and matching reference handling.
 
 ## Deferred masks and inpainting
 
@@ -318,9 +375,10 @@ mask socket ambiguously.
 
 ## Implementation sequence
 
-1. Complete the Anima prerequisites and record their validated host baseline.
-2. Reinspect native apply, LLLite, cloning/attachments, auxiliary-model discovery,
-   and host hook routing at that baseline. Select the reuse/copy boundary.
+1. Preserve the established Anima contract above and track base real-host
+   acceptance separately from source inspection and offline tests.
+2. Confirm the pinned native apply, LLLite, clone, discovery and hook contracts
+   against the chosen host revision and checkpoint. Select the reuse/copy boundary.
 3. Define the configuration object, schema version, plan comparison, and IMAGE
    batch validation. Define ordinary-sampler rejection behavior.
 4. Implement and register the tiled apply node and recognized hook set. Preserve
@@ -347,11 +405,16 @@ Offline CPU tests should use real small tensors and minimal host doubles:
 - Global and distinct local positives use the same spatial patch routing;
   replacing text conditioning does not remove the MODEL patch.
 - Stale plans, wrong counts/shapes, unsupported schema, duplicate patches,
-  unsupported checkpoint channels, and missing dispatch context fail clearly.
+  unsupported checkpoint channels/widths/block coverage, and missing dispatch
+  context fail clearly, including at zero strength or an inactive window.
 - Strength zero and inactive sigma windows preserve baseline behavior. Repeated
   sigma evaluations do not advance a tile-call-based schedule.
 - Compatible patches, live options, auxiliary-model discovery, one sampling
   trajectory, and full-canvas CFG routing remain intact.
+- Exercise patch-owned `models()` discovery and loading separately from explicit
+  `additional_models`. Preserve hook identity across clone and option copies;
+  test the native per-forward reset of `model_patch_data` and rejection when live
+  options lose the invocation's tiled wrapper.
 - Success, injected failure, cancellation, and A→B→A invocations leave original
   MODEL/reference inputs usable and release prepared state.
 - Padding/alignment behavior matches the explicitly chosen Anima policy.
@@ -377,3 +440,15 @@ semantics: different local prompts and independently encoded views can disagree,
 and fusion does not restore full-canvas attention. Validate each new behavior
 before claiming support. The first implementation remains focused on tiled
 upscaling refinement.
+
+[anima-host]: https://github.com/Comfy-Org/ComfyUI/tree/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3
+[anima-detection]: https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/model_detection.py#L848-L881
+[anima-sample]: https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/sample.py#L45-L71
+[anima-samplers]: https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L1210-L1238
+[anima-base]: https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/model_base.py#L1482-L1505
+[anima-apply]: https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy_extras/nodes_model_patch.py#L384-L425
+[anima-lllite]: https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/ldm/anima/lllite.py
+[anima-backbone]: https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/ldm/cosmos/predict2.py
+[anima-patcher]: https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/model_patcher.py#L431-L483
+[anima-patch-discovery]: https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/model_patcher.py#L794-L816
+[anima-loading]: https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/model_management.py#L936-L955

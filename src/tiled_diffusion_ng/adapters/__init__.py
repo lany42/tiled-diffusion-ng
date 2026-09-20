@@ -6,6 +6,7 @@
 from typing import Protocol
 
 from ..geometry import LatentSpec, TilePlanData, TileRegion
+from .anima import AnimaAdapter
 from .sdxl import SDXLAdapter
 
 
@@ -28,13 +29,14 @@ class LatentAdapter(Protocol):
     def accepts(self, model) -> bool: ...
     def describe(self, model, latent) -> LatentSpec: ...
     def validate_sampling(self, model, latent, plan) -> None: ...
+    def validate_model_options(self, options: dict) -> None: ...
     def validate_condition(self, embedding, metadata: dict) -> None: ...
     def validate_evaluation(self, samples, plan: TilePlanData) -> None: ...
     def adapt_spatial_condition(self, condition: dict, region) -> dict: ...
     def create_sampling_context(self, plan: TilePlanData) -> SamplingContext: ...
 
 
-ADAPTERS: tuple[LatentAdapter, ...] = (SDXLAdapter(),)
+ADAPTERS: tuple[LatentAdapter, ...] = (SDXLAdapter(), AnimaAdapter())
 
 
 def resolve_adapter(model) -> LatentAdapter:
@@ -42,5 +44,5 @@ def resolve_adapter(model) -> LatentAdapter:
         if adapter.accepts(model):
             return adapter
     raise ValueError(
-        "Unsupported model/latent family; this release accepts standard SDXL base image models"
+        "Unsupported model/latent family; expected standard SDXL base or native Anima image models"
     )
