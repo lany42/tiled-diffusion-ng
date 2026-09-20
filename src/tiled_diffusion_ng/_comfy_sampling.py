@@ -98,9 +98,10 @@ def prepare_pairs(positives, negative, plan, context):
 
 
 class TileEvaluation:
-    def __init__(self, plan, adapter):
+    def __init__(self, plan, adapter, context):
         self.plan = plan
         self.adapter = adapter
+        self.context = context
         self.weights = {}
 
     def guard_prediction(self, executor, x, timestep, model_options, seed=None):
@@ -168,7 +169,8 @@ class TileEvaluation:
             # All views read this same x/sigma. Call the continuation (never the
             # outer calc_cond_batch), preserving this evaluation's live options.
             tile_x = crop(x_in, region.sampling)
-            predictions = executor(model, tile_conds, tile_x, timestep, model_options)
+            with self.context.tile_options(model_options, region) as options:
+                predictions = executor(model, tile_conds, tile_x, timestep, options)
             if len(predictions) != len(conds):
                 raise ValueError("Host returned an unexpected prediction branch count")
             for index, prediction in enumerate(predictions):
@@ -214,6 +216,7 @@ class TileEvaluation:
         self.weights.clear()
         self.plan = None
         self.adapter = None
+        self.context = None
 
 
 def _detach(clone, wrapper_type):
@@ -267,12 +270,13 @@ def sample(
     # Locals replace each entire positive, including its controls.
     positives = [positive] * 4 if local_positive is None else local_positive
     context = adapter.create_sampling_context(tile_plan)
-    evaluation = TileEvaluation(tile_plan, adapter)
+    evaluation = TileEvaluation(tile_plan, adapter, context)
     clone = None
     try:
+        clone = model.clone()
+        context.prepare_model(clone, latent_image)
         positives, negatives = prepare_pairs(positives, negative, tile_plan, context)
         context.finalize_preparation()
-        clone = model.clone()
         clone.add_wrapper_with_key(
             WrappersMP.PREDICT_NOISE, WRAPPER_KEY, evaluation.guard_prediction
         )

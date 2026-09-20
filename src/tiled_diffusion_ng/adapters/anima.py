@@ -6,6 +6,7 @@
 import torch
 
 from ..geometry import GeometrySignature, LatentSpec, validate_plan
+from ._anima_lllite import validate_hook_options
 from ._anima_sampling import AnimaSamplingContext, validate_control
 
 
@@ -156,40 +157,7 @@ class AnimaAdapter:
             )
 
     def validate_model_options(self, options):
-        transformer = options.get("transformer_options", {})
-        attached = []
-        for field in ("patches", "patches_replace"):
-            groups = transformer.get(field, {})
-            if not isinstance(groups, dict):
-                raise ValueError(f"Unsupported Anima transformer {field}")  # noqa: TRY004
-            for name, patches in groups.items():
-                if field == "patches_replace" and isinstance(patches, dict):
-                    patches = list(patches.values())
-                if not isinstance(patches, (list, tuple)):
-                    raise ValueError(  # noqa: TRY004
-                        f"Unsupported Anima transformer {field}.{name}"
-                    )
-                attached.extend((f"{field}.{name}", patch) for patch in patches)
-        # Recognize even partial native LLLite hook sets without importing the
-        # optional implementation or creating any patch/attachment state.
-        # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy_extras/nodes_model_patch.py#L384-L425
-        for _, patch in attached:
-            if any(
-                cls.__module__ == "comfy.ldm.anima.lllite"
-                and cls.__name__
-                in {
-                    "AnimaLLLitePatch",
-                    "AnimaLLLiteAttentionPatch",
-                    "AnimaLLLiteMLPPatch",
-                }
-                for cls in type(patch).__mro__
-            ):
-                raise NotImplementedError(
-                    "Native AnimaLLLite attachments require tiled reference routing; "
-                    "tiled LLLite integration is deferred"
-                )
-        if attached:
-            raise ValueError(f"Unsupported Anima transformer {attached[0][0]}")
+        validate_hook_options(options)
 
     def validate_condition(self, embedding, metadata):
         validate_control(metadata)

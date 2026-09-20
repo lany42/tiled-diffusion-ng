@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -49,7 +51,12 @@ def test_shared_evaluation_delegates_embedding_and_layout_semantics(host):
 
     adapter = Adapter()
     sampling.validate_conditioning([[{"tokens": (1, 2)}, {}]], adapter, "positive")
-    evaluation = sampling.TileEvaluation(plan, adapter)
+
+    class Context:
+        def tile_options(self, options, region):
+            return nullcontext(options)
+
+    evaluation = sampling.TileEvaluation(plan, adapter, Context())
     regions = []
 
     def next_wrapper(model, branches, tile, sigma, options):
@@ -84,6 +91,12 @@ def test_adapter_context_is_per_invocation_and_always_closed(
             self.regions = []
             self.finalized = 0
             self.closed = 0
+
+        def prepare_model(self, model, latent):
+            self.inner.prepare_model(model, latent)
+
+        def tile_options(self, options, region):
+            return self.inner.tile_options(options, region)
 
         def prepare_pair(self, positive, negative, region):
             self.regions.append(region.tile_id)

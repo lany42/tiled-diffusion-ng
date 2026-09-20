@@ -3,9 +3,9 @@
 
 from comfy_api.latest import ComfyExtension
 
-from .nodes import TilePlan, TileSampler, TileView
+from .nodes import TiledAnimaLLLiteApply, TilePlan, TileSampler, TileView
 
 
 class TiledDiffusionNGExtension(ComfyExtension):
     async def get_node_list(self):
-        return [TilePlan, TileView, TileSampler]
+        return [TilePlan, TileView, TileSampler, TiledAnimaLLLiteApply]

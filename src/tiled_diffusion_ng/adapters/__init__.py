@@ -3,6 +3,7 @@
 
 """Shared adapter contract and explicit model-family registry."""
 
+from contextlib import AbstractContextManager
 from typing import Protocol
 
 from ..geometry import LatentSpec, TilePlanData, TileRegion
@@ -16,6 +17,10 @@ class SamplingContext(Protocol):
     Discover all pairs before finalizing preparation for the host sampler.
     """
 
+    def prepare_model(self, model, latent) -> None: ...
+    def tile_options(
+        self, options: dict, region: TileRegion
+    ) -> AbstractContextManager[dict]: ...
     def prepare_pair(
         self, positive: list[dict], negative: list[dict], region: TileRegion
     ) -> tuple[list[dict], list[dict]]: ...

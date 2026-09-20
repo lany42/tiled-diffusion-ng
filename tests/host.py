@@ -16,6 +16,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from . import lllite_host
+
 
 @contextmanager
 def isolated_host():
@@ -114,6 +116,9 @@ class Wan21Format:
 
 
 class CONST:
+    def percent_to_sigma(self, percent):
+        return 1 - percent
+
     def calculate_input(self, sigma, x):
         return x
 
@@ -134,9 +139,11 @@ class AnimaNetwork:
     concat_padding_mask = True
     rope_h_extrapolation_ratio = rope_w_extrapolation_ratio = 4.0
     rope_t_extrapolation_ratio = 1.0
+    model_channels = 4
 
     def __init__(self, num_blocks):
         self.num_blocks = num_blocks
+        self.blocks = [object() for _ in range(num_blocks)]
         self.pos_embedder = VideoRopePosition3DEmb()
         self.text_calls = []
 
@@ -247,6 +254,28 @@ class Model:
 
     def get_wrappers(self, kind, key):
         return self.wrappers.get(kind, {}).get(key, [])
+
+    def set_attachments(self, key, value):
+        self.attachments[key] = value
+
+    def get_attachment(self, key):
+        return self.attachments.get(key)
+
+    def set_model_patch(self, patch, name):
+        self.model_options["transformer_options"].setdefault("patches", {}).setdefault(
+            name, []
+        ).append(patch)
+
+    def model_patches_models(self):
+        return [
+            model
+            for group in self.model_options["transformer_options"]
+            .get("patches", {})
+            .values()
+            for patch in group
+            if hasattr(patch, "models")
+            for model in patch.models()
+        ]
 
 
 def identity_hint(x):
@@ -409,6 +438,9 @@ class Host:
         self.defer_anima_text = False
         self.native_calls = []
         self.discovered_models = []
+        self.patch_models = []
+        self.lllite_forwards = []
+        self.combine_anima_conditions = False
 
         def module(name, **attrs):
             item = ModuleType(name)
@@ -421,11 +453,25 @@ class Host:
 
         module("comfy")
         module("comfy.model_base", SDXL=SDXL, Anima=Anima)
+        module("comfy.model_patcher", ModelPatcher=Model)
         module("comfy.latent_formats", SDXL=SDXLFormat, Wan21=Wan21Format)
         module("comfy.model_sampling", EPS=EPS, V_PREDICTION=VPrediction, CONST=CONST)
         module("comfy.ldm")
         module("comfy.ldm.anima")
         module("comfy.ldm.anima.model", Anima=AnimaNetwork)
+        module(
+            "comfy.ldm.anima.lllite",
+            **{
+                name: getattr(lllite_host, name)
+                for name in (
+                    "MODULE_PATTERN",
+                    "AnimaLLLite",
+                    "AnimaLLLitePatch",
+                    "AnimaLLLiteAttentionPatch",
+                    "AnimaLLLiteMLPPatch",
+                )
+            },
+        )
         module("comfy.ldm.cosmos")
         module(
             "comfy.ldm.cosmos.position_embedding",
@@ -524,7 +570,9 @@ class Host:
         if self.fail_tile == len(self.tile_calls):
             raise RuntimeError("deliberate tile failure")
         outputs = []
-        for branch in branches:
+        if isinstance(model, Anima) and self.combine_anima_conditions:
+            return self.anima_combined(model, branches, x, sigma, options)
+        for branch_index, branch in enumerate(branches):
             active = []
             for entry in branch or []:
                 if (
@@ -540,6 +588,7 @@ class Host:
                     # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L309-L334
                     transformer = copy_containers(options["transformer_options"])
                     transformer["sigmas"] = sigma
+                    transformer["cond_or_uncond"] = [branch_index]
                     prediction = self.call_wrappers(
                         transformer,
                         "apply_model",
@@ -562,7 +611,7 @@ class Host:
         return outputs
 
     @staticmethod
-    def call_wrappers(options, kind, original, *args):
+    def call_wrappers(options, kind, original, *args, **kwargs):
         wrappers = [
             wrapper
             for group in options.get("wrappers", {}).get(kind, {}).values()
@@ -580,20 +629,34 @@ class Host:
                 **kwargs,
             )
 
-        return continuation(0, *args)
+        return continuation(0, *args, **kwargs)
 
     def anima_apply_model(self, model, x, sigma, conditions, transformer):
         native_sampling = self.latest_clone.sampling
         model_input = native_sampling.calculate_input(sigma, x)
+
+        def forward(x, timesteps, context, fps, padding_mask, *, transformer_options):
+            return self.anima_forward(
+                model,
+                x,
+                timesteps,
+                {**conditions, "c_crossattn": context},
+                transformer_options,
+            )
+
+        # Native MiniTrainDIT.forward passes transformer_options by keyword to
+        # DIFFUSION_MODEL wrappers; it is not another positional model argument.
+        # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/ldm/cosmos/predict2.py#L837-L851
         prediction = self.call_wrappers(
             transformer,
             "diffusion_model",
-            self.anima_forward,
-            model,
+            forward,
             model_input,
             sigma,
-            conditions,
-            transformer,
+            conditions["c_crossattn"],
+            None,
+            None,
+            transformer_options=transformer,
         )
         # BaseModel converts the native prediction to float32 before denoising.
         # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/model_base.py#L251-L255
@@ -606,7 +669,60 @@ class Host:
             embedding = model.diffusion_model.preprocess_text_embeds(
                 embedding, conditions["t5xxl_ids"], conditions["t5xxl_weights"]
             )
-        return x * 0.25 + embedding.mean().to(x)
+        text = embedding.mean(dim=(1, 2)).to(x).reshape(-1, 1, 1, 1, 1)
+        return x * 0.25 + text + lllite_host.forward_hooks(self, model, x, transformer)
+
+    def anima_combined(self, model, branches, x, sigma, options):
+        entries = [
+            (index, entry)
+            for index, branch in enumerate(branches)
+            for entry in branch or []
+            if entry.get("timestep_end", 0)
+            <= sigma[0]
+            <= entry.get("timestep_start", 1)
+        ]
+        if not entries:
+            return [torch.zeros_like(x) for _ in branches]
+        batch = x.shape[0]
+        model_input = torch.cat([x for _ in entries])
+        conditions = {
+            "c_crossattn": torch.cat(
+                [
+                    entry["model_conds"]["c_crossattn"].expand(batch, -1, -1)
+                    for _, entry in entries
+                ]
+            )
+        }
+        combined_sigma = sigma.expand(batch).repeat(len(entries))
+        transformer = dict(
+            options["transformer_options"],
+            sigmas=combined_sigma,
+            cond_or_uncond=[i for i, _ in entries],
+        )
+        prediction = self.call_wrappers(
+            transformer,
+            "apply_model",
+            self.anima_apply_model,
+            model,
+            model_input,
+            combined_sigma,
+            conditions,
+            transformer,
+        )
+        chunks = prediction.split(batch)
+        outputs = []
+        for index in range(len(branches)):
+            active = [
+                (chunk, entry.get("strength", 1))
+                for (i, entry), chunk in zip(entries, chunks)
+                if i == index
+            ]
+            outputs.append(
+                sum(p * w for p, w in active) / sum(w for _, w in active)
+                if active
+                else torch.zeros_like(x)
+            )
+        return outputs
 
     def common_ksampler(
         self,
@@ -623,6 +739,7 @@ class Host:
     ):
         self.latest_clone = model
         self.discovered_models.extend(model.get_nested_additional_models())
+        self.patch_models.extend(model.model_patches_models())
         self.common_calls.append(
             {
                 "seed": seed,

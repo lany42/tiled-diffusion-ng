@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
 
-"""Invocation ownership for Anima's currently text-only tiled conditioning."""
+"""Invocation ownership for Anima text and tiled LLLite conditioning."""
+
+from ._anima_lllite import LLLiteInvocation
 
 
 def validate_control(condition):
@@ -18,6 +20,13 @@ def validate_control(condition):
 class AnimaSamplingContext:
     def __init__(self, plan):
         self.plan = plan
+        self.lllite = LLLiteInvocation(plan)
+
+    def prepare_model(self, model, latent):
+        self.lllite.prepare_model(model, latent)
+
+    def tile_options(self, options, region):
+        return self.lllite.tile_options(options, region)
 
     def prepare_pair(self, positive, negative, region):
         if self.plan is None:
@@ -35,4 +44,5 @@ class AnimaSamplingContext:
             raise RuntimeError("Anima sampling invocation has already closed")
 
     def close(self):
+        self.lllite.close()
         self.plan = None

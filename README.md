@@ -14,7 +14,7 @@ git clone https://git.colorized.life/tiled-diffusion-ng.git tiled-diffusion-ng
 | Model | Supported | ControlNets |
 | --- | :---: | :---: |
 | SDXL | ☑ | ☑ |
-| Anima | ☐ | ☐ |
+| Anima | ☑ | ☑ |
 | Krea2 | ☐ | ☐ |
 
 SDXL support covers base models and ordinary RGB SDXL ControlNet.

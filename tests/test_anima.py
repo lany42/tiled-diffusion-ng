@@ -6,7 +6,7 @@
 Inspected source: ComfyUI 944386c233e02eaf877b1c8d5d513fb3d3a4d5e3.
 Real-host generation/refinement, portrait/landscape, local prompts, LoRAs and
 seam acceptance remain pending separately for Base, Aesthetic, Turbo and 2.9B.
-LLLite execution is deferred; its native hook names are only rejection fixtures.
+Tiled LLLite contracts live in test_anima_lllite.py; native chaining is deferred.
 """
 
 import copy
@@ -603,7 +603,7 @@ def test_native_lllite_hooks_have_explicit_deferred_guard(host, slot, name, live
     else:
         attach(args["model"].model_options)
     with pytest.raises(
-        NotImplementedError, match="AnimaLLLite.*tiled reference routing.*deferred"
+        NotImplementedError, match="AnimaLLLiteApply chaining is unsupported"
     ):
         sampling.sample(**args)
     assert len(host.common_calls) == int(live)
@@ -705,9 +705,16 @@ def test_clone_live_options_continuations_sigmas_and_auxiliary_discovery(host):
         assert transformer["optimized_attention_override"] is optimized_attention
         return executor(base, x, sigma, conditions, transformer)
 
+    def native_forward(executor, x, sigma, *args, transformer_options):
+        assert transformer_options["sigmas"] is sigma
+        assert (
+            transformer_options["optimized_attention_override"] is optimized_attention
+        )
+        return executor(x, sigma, *args, transformer_options=transformer_options)
+
     model.add_wrapper_with_key("calc_cond_batch", "outer", outer)
     model.add_wrapper_with_key("apply_model", "native", native)
-    model.add_wrapper_with_key("diffusion_model", "native", native)
+    model.add_wrapper_with_key("diffusion_model", "native", native_forward)
     common = host.nodes.common_ksampler
 
     def common_with_inner(clone, *a, **kw):

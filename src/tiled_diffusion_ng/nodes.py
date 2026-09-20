@@ -1,16 +1,65 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
 
-"""The three public V3 nodes; local positives use execution-list transport."""
+"""Public V3 nodes; local positives use execution-list transport."""
 
 from comfy_api.latest import io
 
 from . import _comfy_sampling
 from .adapters import resolve_adapter
+from .adapters._anima_lllite import apply_lllite
 from .geometry import image_views, make_plan
 
 PLAN = io.Custom("TILE_PLAN")
 CATEGORY = "Tiled Diffusion NG"
+
+
+class TiledAnimaLLLiteApply(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TiledDiffusionNG_TiledAnimaLLLiteApply",
+            display_name="TiledAnimaLLLiteApply",
+            category=CATEGORY,
+            description="Apply one native-loaded RGB Anima LLLite MODEL_PATCH for tiled refinement. Create TilePlan from the base MODEL and target LATENT, crop the matching canvas with TileView, then apply and sample with that same complete TilePlan. Reference order is image 0 TL/TR/BR/BL, then image 1 TL/TR/BR/BL; one group may broadcast to the latent batch. Local positives change text guidance while this MODEL patch remains active on whichever branches native sampling evaluates. Use TileSampler. Repeated application, native AnimaLLLiteApply chaining, masks and four-channel checkpoints are unsupported.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Custom("MODEL_PATCH").Input("model_patch"),
+                PLAN.Input("tile_plan"),
+                io.Image.Input("reference_tiles"),
+                io.Float.Input("strength", default=1.0, min=-10.0, max=10.0, step=0.01),
+                io.Float.Input(
+                    "start_percent", default=0.0, min=0.0, max=1.0, step=0.001
+                ),
+                io.Float.Input(
+                    "end_percent", default=1.0, min=0.0, max=1.0, step=0.001
+                ),
+            ],
+            outputs=[io.Model.Output("model")],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model,
+        model_patch,
+        tile_plan,
+        reference_tiles,
+        strength=1.0,
+        start_percent=0.0,
+        end_percent=1.0,
+    ):
+        return io.NodeOutput(
+            apply_lllite(
+                model,
+                model_patch,
+                tile_plan,
+                reference_tiles,
+                strength,
+                start_percent,
+                end_percent,
+            )
+        )
 
 
 class TilePlan(io.ComfyNode):
@@ -71,7 +120,7 @@ class TileSampler(io.ComfyNode):
             node_id="TiledDiffusionNG_TileSampler",
             display_name="TileSampler",
             category=CATEGORY,
-            description="One native trajectory for SDXL or Anima images. Anima accepts 4D or single-frame 5D latents and returns 5D. Anima controls are unsupported; LLLite is deferred. Choose sampling settings for your checkpoint, including CFG 1 for Turbo when appropriate.",
+            description="One native trajectory for SDXL or Anima images. Anima accepts 4D or single-frame 5D latents and returns 5D. Use TiledAnimaLLLiteApply with the same TilePlan for RGB refinement; native AnimaLLLiteApply chaining and conditioning controls are unsupported. Choose sampling settings for your checkpoint, including CFG 1 for Turbo when appropriate.",
             is_input_list=True,
             inputs=[
                 io.Model.Input("model"),
@@ -96,7 +145,7 @@ class TileSampler(io.ComfyNode):
                 io.Conditioning.Input(
                     "local_positive",
                     optional=True,
-                    tooltip="Four complete positives in execution-list order: TL, TR, BR, BL. Each replaces the global positive, including SDXL controls. Attach controls to SDXL locals when needed. Use a list producer, not ConditioningCombine.",
+                    tooltip="Four complete positives in execution-list order: TL, TR, BR, BL. Each replaces the global positive, including SDXL controls. For Anima, locals replace text guidance while the MODEL's tiled LLLite patch stays active on whichever branches native sampling evaluates. Use a list producer, not ConditioningCombine.",
                 ),
             ],
             outputs=[io.Latent.Output("latent")],

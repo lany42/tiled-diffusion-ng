@@ -3,6 +3,8 @@
 
 """SDXL architecture requirements for native image-hint ControlNets."""
 
+from contextlib import nullcontext
+
 from ._native_control import NativeControlContext
 
 
@@ -27,3 +29,9 @@ class SDXLSamplingContext(NativeControlContext):
 
     def __init__(self, plan):
         super().__init__(plan, _validate_network)
+
+    def prepare_model(self, model, latent):
+        pass
+
+    def tile_options(self, options, region):
+        return nullcontext(options)

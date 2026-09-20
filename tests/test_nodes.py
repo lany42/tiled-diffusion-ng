@@ -4,6 +4,7 @@
 import asyncio
 import importlib.util
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -60,22 +61,65 @@ def test_host_imports_and_registries_are_restored_between_runs():
     assert results[0].equal(results[1])
 
 
-def test_three_node_extension_and_clone_loader(host, monkeypatch):
+@pytest.mark.parametrize("archive", [False, True])
+def test_four_node_extension_and_clone_loader(host, monkeypatch, tmp_path, archive):
     extension = asyncio.run(comfy_entrypoint())
     classes = asyncio.run(extension.get_node_list())
     assert [c.define_schema().node_id for c in classes] == [
         "TiledDiffusionNG_TilePlan",
         "TiledDiffusionNG_TileView",
         "TiledDiffusionNG_TileSampler",
+        "TiledDiffusionNG_TiledAnimaLLLiteApply",
     ]
+    root = ROOT
+    if archive:
+        path = tmp_path / "source.zip"
+        with zipfile.ZipFile(path, "w") as zipped:
+            for source in [ROOT / "__init__.py", *(ROOT / "src").rglob("*.py")]:
+                zipped.write(source, source.relative_to(ROOT))
+        root = tmp_path / "extracted"
+        with zipfile.ZipFile(path) as zipped:
+            zipped.extractall(root)
     loader = importlib.util.spec_from_file_location(
-        "tdng_clone", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)]
+        "tdng_clone", root / "__init__.py", submodule_search_locations=[str(root)]
     )
     module = importlib.util.module_from_spec(loader)
     monkeypatch.setitem(sys.modules, "tdng_clone", module)
     loader.loader.exec_module(module)
     nodes = asyncio.run(asyncio.run(module.comfy_entrypoint()).get_node_list())
-    assert len(nodes) == 3
+    assert len(nodes) == 4
+
+
+def test_tiled_lllite_schema_and_execution(host):
+    from tiled_diffusion_ng.adapters._anima_lllite import get_attachment
+    from tiled_diffusion_ng.nodes import TiledAnimaLLLiteApply
+
+    from .test_anima_lllite import patched
+
+    schema = TiledAnimaLLLiteApply.define_schema()
+    assert schema.display_name == "TiledAnimaLLLiteApply"
+    assert not getattr(schema, "is_input_list", False)
+    inputs = {i.id: i for i in schema.inputs}
+    assert list(inputs) == [
+        "model",
+        "model_patch",
+        "tile_plan",
+        "reference_tiles",
+        "strength",
+        "start_percent",
+        "end_percent",
+    ]
+    assert (
+        inputs["strength"].default,
+        inputs["strength"].min,
+        inputs["strength"].max,
+    ) == (1, -10, 10)
+    assert (inputs["start_percent"].default, inputs["end_percent"].default) == (0, 1)
+    assert len(schema.outputs) == 1
+    args, source, refs, patch = patched()
+    result = TiledAnimaLLLiteApply.execute(source, patch, args["tile_plan"], refs)
+    assert len(result) == 1 and result[0] is not source
+    assert get_attachment(result[0]).config.reference_tiles is refs
 
 
 def test_schema_defaults_and_singleton_execution_transport(host):
