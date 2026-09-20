@@ -8,6 +8,7 @@ from typing import Protocol
 
 from ..geometry import LatentSpec, TilePlanData, TileRegion
 from .anima import AnimaAdapter
+from .krea2 import Krea2Adapter
 from .sdxl import SDXLAdapter
 
 
@@ -41,7 +42,7 @@ class LatentAdapter(Protocol):
     def create_sampling_context(self, plan: TilePlanData) -> SamplingContext: ...
 
 
-ADAPTERS: tuple[LatentAdapter, ...] = (SDXLAdapter(), AnimaAdapter())
+ADAPTERS: tuple[LatentAdapter, ...] = (SDXLAdapter(), AnimaAdapter(), Krea2Adapter())
 
 
 def resolve_adapter(model) -> LatentAdapter:
@@ -49,5 +50,5 @@ def resolve_adapter(model) -> LatentAdapter:
         if adapter.accepts(model):
             return adapter
     raise ValueError(
-        "Unsupported model/latent family; expected standard SDXL base or native Anima image models"
+        "Unsupported model/latent family; expected standard SDXL base or native Anima or Krea2 image models"
     )

@@ -69,7 +69,7 @@ class TilePlan(io.ComfyNode):
             node_id="TiledDiffusionNG_TilePlan",
             display_name="TilePlan",
             category=CATEGORY,
-            description="Four views for SDXL or native Anima (Base, Aesthetic, Turbo, 2.9B). Anima requires canvas dimensions divisible by 16 pixels; overlap rounds to aligned views without padding.",
+            description="Four views for SDXL, native Anima (Base, Aesthetic, Turbo, 2.9B), or Krea2 (Raw, Turbo). Anima and Krea2 require 16-channel image latents and canvas dimensions divisible by 16 pixels; overlap rounds to aligned views without padding.",
             inputs=[
                 io.Model.Input("model"),
                 io.Latent.Input("latent"),
@@ -120,7 +120,14 @@ class TileSampler(io.ComfyNode):
             node_id="TiledDiffusionNG_TileSampler",
             display_name="TileSampler",
             category=CATEGORY,
-            description="One native trajectory for SDXL or Anima images. Anima accepts 4D or single-frame 5D latents and returns 5D. Use TiledAnimaLLLiteApply with the same TilePlan for RGB refinement; native AnimaLLLiteApply chaining and conditioning controls are unsupported. Choose sampling settings for your checkpoint, including CFG 1 for Turbo when appropriate.",
+            description=(
+                "One native trajectory for SDXL, Anima, or Krea2 Raw/Turbo generation and refinement. "
+                "Anima/Krea2 accept 16-channel 4D or single-frame 5D targets, require B×1×1×H×W noise masks, and return 5D. "
+                "Krea2 keeps whole B×16×1×H×W references; choose index or index_timestep_zero with Edit Model Reference Method. "
+                "Anima/Krea2 conditioning ControlNets are unsupported; Krea2 LLLite remains TBD. "
+                "For Anima RGB refinement use TiledAnimaLLLiteApply with the same plan; native LLLite chaining is unsupported. "
+                "Choose checkpoint-appropriate sampler/CFG settings; Turbo supports CFG 1 with ConditioningZeroOut."
+            ),
             is_input_list=True,
             inputs=[
                 io.Model.Input("model"),
@@ -137,15 +144,21 @@ class TileSampler(io.ComfyNode):
                 ),
                 io.Combo.Input("sampler_name", options=list(KSampler.SAMPLERS)),
                 io.Combo.Input("scheduler", options=list(KSampler.SCHEDULERS)),
-                io.Conditioning.Input("positive"),
-                io.Conditioning.Input("negative"),
+                io.Conditioning.Input(
+                    "positive",
+                    tooltip="Used for every view unless local_positive supplies four complete replacements.",
+                ),
+                io.Conditioning.Input(
+                    "negative",
+                    tooltip="Shared across all views. ConditioningZeroOut is supported and preserves reference metadata. ComfyUI skips negative evaluation at CFG 1 unless a hook requests it.",
+                ),
                 io.Latent.Input("latent_image"),
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01),
                 PLAN.Input("tile_plan"),
                 io.Conditioning.Input(
                     "local_positive",
                     optional=True,
-                    tooltip="Four complete positives in execution-list order: TL, TR, BR, BL. Each replaces the global positive, including SDXL controls. For Anima, locals replace text guidance while the MODEL's tiled LLLite patch stays active on whichever branches native sampling evaluates. Use a list producer, not ConditioningCombine.",
+                    tooltip="Four complete positives in TL/TR/BR/BL execution-list order. Each replaces the entire global positive, including Krea2 embeddings/references/method or SDXL controls. The supplied negative stays independent. Anima's MODEL LLLite patch remains active on evaluated branches. Use a list producer, not ConditioningCombine.",
                 ),
             ],
             outputs=[io.Latent.Output("latent")],

@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from . import lllite_host
+from . import krea2_host, lllite_host
 
 
 @contextmanager
@@ -210,7 +210,13 @@ class SDXL:
 
 class Model:
     def __init__(self, family="sdxl", *, num_blocks=28):
-        self.model = SDXL() if family == "sdxl" else Anima(num_blocks)
+        self.model = (
+            SDXL()
+            if family == "sdxl"
+            else krea2_host.Krea2(num_blocks)
+            if family == "krea2"
+            else Anima(num_blocks)
+        )
         self.format = SDXLFormat() if family == "sdxl" else Wan21Format()
         self.sampling = EPS() if family == "sdxl" else CONST()
         self.model_options = {"transformer_options": {}}
@@ -220,6 +226,8 @@ class Model:
         self.patches = {"lora": [object()]}
 
     def get_model_object(self, name):
+        if name == "diffusion_model.default_ref_method":
+            return self.model.diffusion_model.default_ref_method
         if name == "diffusion_model":
             return self.model.diffusion_model
         return {"latent_format": self.format, "model_sampling": self.sampling}[name]
@@ -441,6 +449,7 @@ class Host:
         self.patch_models = []
         self.lllite_forwards = []
         self.combine_anima_conditions = False
+        self.krea2_calls = []
 
         def module(name, **attrs):
             item = ModuleType(name)
@@ -452,11 +461,21 @@ class Host:
             return item
 
         module("comfy")
-        module("comfy.model_base", SDXL=SDXL, Anima=Anima)
+        module("comfy.model_base", SDXL=SDXL, Anima=Anima, Krea2=krea2_host.Krea2)
+        module(
+            "comfy.conds",
+            CONDRegular=krea2_host.CONDRegular,
+            CONDList=krea2_host.CONDList,
+            CONDConstant=krea2_host.CONDConstant,
+        )
         module("comfy.model_patcher", ModelPatcher=Model)
         module("comfy.latent_formats", SDXL=SDXLFormat, Wan21=Wan21Format)
         module("comfy.model_sampling", EPS=EPS, V_PREDICTION=VPrediction, CONST=CONST)
         module("comfy.ldm")
+        module("comfy.ldm.krea2")
+        module("comfy.ldm.krea2.model", SingleStreamDiT=krea2_host.Krea2Network)
+        module("comfy.ldm.flux")
+        module("comfy.ldm.flux.layers", EmbedND=krea2_host.EmbedND)
         module("comfy.ldm.anima")
         module("comfy.ldm.anima.model", Anima=AnimaNetwork)
         module(
@@ -569,6 +588,8 @@ class Host:
         self.tile_calls.append((branches, x.clone(), sigma.clone(), options))
         if self.fail_tile == len(self.tile_calls):
             raise RuntimeError("deliberate tile failure")
+        if isinstance(model, krea2_host.Krea2):
+            return krea2_host.leaf(self, model, branches, x, sigma, options)
         outputs = []
         if isinstance(model, Anima) and self.combine_anima_conditions:
             return self.anima_combined(model, branches, x, sigma, options)
@@ -761,6 +782,8 @@ class Host:
                 if isinstance(model.model, Anima):
                     with torch.inference_mode(not self.defer_anima_text):
                         item["model_conds"] = model.model.extra_conds(**item)
+                elif isinstance(model.model, krea2_host.Krea2):
+                    item["model_conds"] = model.model.extra_conds(**item)
                 else:
                     item["model_conds"] = {
                         "c_crossattn": embedding,
@@ -771,10 +794,18 @@ class Host:
                     }
                 # Percent settings override explicit timesteps when present.
                 # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L859-L882
-                if "start_percent" in metadata:
-                    item["timestep_start"] = 1 - metadata["start_percent"]
-                if "end_percent" in metadata:
-                    item["timestep_end"] = 1 - metadata["end_percent"]
+                if "clip_start_percent" in metadata:
+                    item["timestep_start"] = 1 - max(
+                        metadata["clip_start_percent"], metadata.get("start_percent", 0)
+                    )
+                    item["timestep_end"] = 1 - min(
+                        metadata["clip_end_percent"], metadata.get("end_percent", 1)
+                    )
+                else:
+                    if "start_percent" in metadata:
+                        item["timestep_start"] = 1 - metadata["start_percent"]
+                    if "end_percent" in metadata:
+                        item["timestep_end"] = 1 - metadata["end_percent"]
                 # Native hook discovery checks key presence, including None.
                 # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/sampler_helpers.py#L31-L50
                 if "control" in metadata:
@@ -894,7 +925,7 @@ class Host:
             x = self.samplers.sampler_object(sampler_name).sampler_function(
                 evaluate, x, sigmas
             )
-            if isinstance(model.model, Anima):
+            if isinstance(model.model, (Anima, krea2_host.Krea2)):
                 # Native output conversion is host-owned, independent of the
                 # input/model precision. Wan21 scaling itself is not simulated.
                 # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L1237-L1238
