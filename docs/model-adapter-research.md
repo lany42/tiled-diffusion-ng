@@ -1,7 +1,7 @@
 # Model adapter research
 
-**Unimplemented:** Anima, Krea2 Raw and Krea2 Turbo remain follow-on work after
-[SDXL manual acceptance](manual-validation.md). The sources below are research
+**Unimplemented:** Anima, Krea2 Raw and Krea2 Turbo remain follow-on work.
+SDXL visual validation has passed. The sources below are research
 starting points at ComfyUI
 [`3c80da7f87ee359b2d06f107cb3c0797079dfbbb`][comfy], not support claims.
 

@@ -4,7 +4,11 @@ This comparison retains the source baseline at
 [`a155b1bac39147381aeaa52b9be42e545626a44f`][upstream]. Both implementations
 combine overlapping predictions while ComfyUI advances a global sample.
 Tiled Diffusion NG is an independent, narrower implementation of Mixture of
-Diffusers. Real-host and visual comparisons remain [pending](manual-validation.md).
+Diffusers. The maintainer completed manual SDXL visual validation and found
+results essentially identical to upstream, including visually indistinguishable
+results with Tile ControlNet active. This satisfies visual acceptance; the
+detailed [host compatibility checks](comfyui-compatibility.md#contract-matrix)
+remain unresolved.
 
 ## Geometry, workflow and integration
 
@@ -20,10 +24,8 @@ Both pixel and latent upscale workflows compose through ordinary external nodes.
 This project's iterative stages use fresh plans when geometry changes and one
 trajectory per stage. VAE, upscaling, text encoding and VLM calls remain external.
 This interface difference does not imply that upstream requires pixel upscaling.
-For a fair comparison, match actual sampling boxes and effective overlap; the
-[portrait settings](manual-validation.md#reproducible-comparison) produce four
-views at overlaps 64 and 128. Nominal quadrant cores are smaller than those
-sampling boxes.
+For a fair comparison, match actual sampling boxes and effective overlap.
+Nominal quadrant cores are smaller than those sampling boxes.
 
 ## Gaussian differences
 
@@ -48,6 +50,10 @@ isolated corrected upstream checkout is an optional comparison reference.
 
 ## Performance limits
 
+The maintainer observed approximately 10 ms slower execution over roughly 1 MP
+tiles and accepted this overhead. Correctness of the reimplementation was the
+goal, and the visual comparison met that goal.
+
 Four sequential views reduce each denoiser's spatial extent, but every stage
 still retains full-canvas latents, noise, branch accumulators and a denominator,
 as well as tile activations and control caches. Fixed tile count cannot promise
@@ -61,7 +67,7 @@ settings, checkpoints, precision, device/backend and warmup. Report CPU/CUDA
 allocated peaks and the method separately from process RSS and CUDA reserved
 memory. Caller-owned images, weights, activations, prepared caches, resize
 temporaries and allocator reserves are outside the retained hint payload.
-No measured GPU savings or general speedup is claimed before real-host results.
+No measured GPU memory savings or general speedup is claimed.
 
 [upstream]: https://github.com/shiimizu/ComfyUI-TiledDiffusion/tree/a155b1bac39147381aeaa52b9be42e545626a44f
 [splitter]: https://github.com/shiimizu/ComfyUI-TiledDiffusion/blob/a155b1bac39147381aeaa52b9be42e545626a44f/tiled_diffusion.py#L68-L86

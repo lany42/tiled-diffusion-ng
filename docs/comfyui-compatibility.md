@@ -8,7 +8,7 @@ check. Host and extension updates require renewed inspection and execution.
 
 The retained source inspection baseline is **2026-09-19**:
 
-| Component | Inspected revision | Actual host execution |
+| Component | Inspected revision | Execution at inspected revision |
 | --- | --- | --- |
 | ComfyUI | [`3c80da7f87ee359b2d06f107cb3c0797079dfbbb`][comfy] | Pending |
 | ComfyUI-TiledDiffusion | [`a155b1bac39147381aeaa52b9be42e545626a44f`][tiled] | Pending |
@@ -19,13 +19,18 @@ tensors and project-written [host doubles](../tests/host.py); they cannot detect
 upstream changes by themselves. The recorded isolated CPU probes of
 `convert_cond`, `apply_empty_x_to_equal_area`, `encode_model_conds`,
 `sampling_function` and `WrapperExecutor` exercised selected pinned functions,
-not a complete host. Real SDXL, ControlNet, RES4LYF and visual acceptance remain
-pending; no row below is completed by those CPU results.
+not a complete host. No row below is completed by those CPU results.
+
+The maintainer's manual SDXL visual validation passed, including Tile ControlNet,
+with results essentially identical to upstream TiledDiffusion. This establishes
+visual acceptance, but does not resolve the detailed host contract checks or
+confirm execution at the exact inspected revisions above.
 
 ## Contract matrix
 
-All host checks in the final column are **pending**. Implementation and test
-pointers identify offline coverage, not proof of actual host compatibility.
+Detailed host checks in the final column remain **pending**; visual acceptance
+is recorded separately in the final row. Implementation and test pointers
+identify offline coverage, not proof of actual host compatibility.
 
 | Contract | Pinned source boundary | Implementation / CPU coverage | Outstanding host check |
 | --- | --- | --- | --- |
@@ -40,7 +45,7 @@ pointers identify offline coverage, not proof of actual host compatibility.
 | Iterative latent upscaling | [native sampling entry][ksampler] | `sample`, plan validation; [sampling tests](../tests/test_sampling.py) for repeated stages and [geometry tests](../tests/test_geometry.py) for stale plans | Execute two external latent-upscale/refinement stages with fresh plans, ordinary LATENT links and no implicit VAE round trip. Each stage starts its own trajectory. |
 | Iterative pixel upscaling | [native sampling entry][ksampler] | Same sampling and plan contracts; external VAE/upscaler execution is outside CPU doubles | Execute two explicit decode/upscale/encode/refinement stages with fresh plans and caller-selected VAE boundaries. |
 | Invocation isolation and cleanup | [model cloning][patcher], [wrappers][wrappers], [control cleanup][controlnet] | `sample`/`TileEvaluation.close`, `SDXLSamplingContext.close`; [adapter](../tests/test_adapters.py), [sampling](../tests/test_sampling.py) and [hint lifetime tests](../tests/test_control_hints.py) | Check compatible-plan reuse, stale-plan rejection, A→B→A repeatability, cancellation and deliberate failure. Original inputs must remain usable, project wrappers must detach, and hints/caches/stage state must be released. |
-| Visual acceptance | [upstream Mixture of Diffusers][tiled-mod] | [Mathematics](mathematics.md) and numerical tests establish bounded identities only | Complete the [reproducible comparison](manual-validation.md#reproducible-comparison), save settings/images and obtain the user's favorable portrait review without unresolved material regressions. |
+| Visual acceptance | [upstream Mixture of Diffusers][tiled-mod] | [Mathematics](mathematics.md) and numerical tests establish bounded identities only | Passed by maintainer visual inspection for SDXL, including Tile ControlNet; see [comparison results](tileddiffusion-comparison.md). Detailed host contracts above remain unresolved. |
 
 The SDXL adapter owns model/layout validation and spatial preparation; shared
 orchestration owns pairing, routing, fusion and one `common_ksampler` trajectory.

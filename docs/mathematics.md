@@ -25,8 +25,7 @@ axis. This fixed-four policy is a project choice, not a formula from the paper.
 Combining the axes gives clockwise TL/TR/BR/BL sampling rectangles. Bounds are
 half-open `(x0, y0, x1, y1)`; dimension pairs are `(H, W)`. Pixel bounds multiply
 by each axis's scale. Diagnostic cores split at `floor(L/2)`; the sampling
-rectangles include overlap. See [geometry.py](../src/tiled_diffusion_ng/geometry.py)
-and the [portrait comparison](manual-validation.md#reproducible-comparison).
+rectangles include overlap. See [geometry.py](../src/tiled_diffusion_ng/geometry.py).
 
 ## Regional predictions and Gaussian fusion
 
@@ -95,8 +94,9 @@ change valid tiny edge weights.
 [Geometry tests](../tests/test_geometry.py) compare against feasible-extent
 enumeration and handwritten rectangles. [Fusion tests](../tests/test_fusion.py)
 check scalar kernels, symmetry, coverage, constant preservation, CFG and affine
-identities, and precision. These CPU checks establish numerical contracts;
-[visual acceptance](manual-validation.md) remains pending.
+identities, and precision. These CPU checks establish numerical contracts.
+Separately, SDXL [visual validation](tileddiffusion-comparison.md) passed,
+including Tile ControlNet.
 
 [paper]: https://arxiv.org/html/2302.02412v1#S3
 [canvas]: https://github.com/albarji/mixture-of-diffusers/blob/af42292d0a8cb414f6da2eeac79be4c60afbbe48/mixdiff/canvas.py#L187-L200

@@ -1,6 +1,6 @@
 # Tiled Diffusion NG
 
-Three ComfyUI nodes for SDXL tiled sampling, blending four overlapping views into
+Three ComfyUI nodes for tiled sampling, blending four overlapping views into
 one full-resolution latent through a single KSampler trajectory.
 
 ```bash
@@ -9,10 +9,15 @@ git clone https://git.colorized.life/tiled-diffusion-ng.git tiled-diffusion-ng
 # Restart ComfyUI.
 ```
 
-Requires Python 3.13+ and ComfyUI's V3 extension/wrapper APIs. No additional runtime
-dependencies. Currently targets SDXL base models; real-host GPU validation is
-pending. See [compatibility](docs/comfyui-compatibility.md) and
-[validation status](docs/manual-validation.md).
+## Supported models
+
+| Model | Supported | ControlNets |
+| --- | :---: | :---: |
+| SDXL | ☑ | ☑ |
+| Anima | ☐ | ☐ |
+| Krea2 | ☐ | ☐ |
+
+SDXL support covers base models and ordinary RGB SDXL ControlNet.
 
 ## Nodes
 
