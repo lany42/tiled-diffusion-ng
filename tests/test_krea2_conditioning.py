@@ -12,6 +12,7 @@ adherence; they test delegation without recreating or patching those operations.
 
 import asyncio
 import gc
+import math
 import sys
 import weakref
 
@@ -24,6 +25,7 @@ from tiled_diffusion_ng._krea2_conditioning import encode_tiles
 from tiled_diffusion_ng.geometry import TILE_IDS
 
 from . import krea2_conditioning_host as encoder_host
+from . import krea2_host
 from .krea2_host import cond
 from .test_krea2 import arguments as sampler_arguments
 
@@ -34,6 +36,122 @@ VISION = "<|vision_start|><|image_pad|><|vision_end|>"
 def clip(host, monkeypatch):
     encoder_host.install(monkeypatch)
     return encoder_host.Clip()
+
+
+@pytest.fixture
+def predictions(host, monkeypatch):
+    from tiled_diffusion_ng.nodes import TileSampler
+
+    forward = krea2_host.forward
+
+    def nonlinear(host, x, sigma, context, *args, **kwargs):
+        output = forward(host, x, sigma, context, *args, **kwargs)
+        text = context.mean((1, 2)).to(x).reshape(-1, 1, 1, 1, 1)
+        return output + text.square() / 32
+
+    monkeypatch.setattr(krea2_host, "forward", nonlinear)
+
+    def run(local, *, batch=1, cfg=1, sigmas=(0.625,)):
+        args = sampler_arguments(batch=batch, cfg=cfg, negative=cond(-3, width=30720))
+        args["model"].model.diffusion_model.txtdim = 2560
+        # Complete replacement excludes the global embedding and its references.
+        args["positive"] = cond(
+            999,
+            width=30720,
+            reference_latents=[torch.ones(1, 16, 1, 3, 3)],
+            reference_latents_method="index",
+        )
+        hooks, captures, tile_outputs, tile_model_calls = [], [], [], []
+
+        def pre(data):
+            hooks.append("pre")
+            assert data["conds_out"][0].shape == (batch, 16, 1, 12, 16)
+            return data["conds_out"]
+
+        def guide(data):
+            hooks.append("cfg")
+            return data["uncond"] + data["cond_scale"] * (data["cond"] - data["uncond"])
+
+        def post(data):
+            hooks.append("post")
+            captures.append(data)
+            return data["denoised"] + 0.125
+
+        args["model"].model_options.update(
+            sampler_pre_cfg_function=[pre],
+            sampler_cfg_function=guide,
+            sampler_post_cfg_function=[post],
+        )
+
+        def solve(evaluate, x, schedule):
+            # Each comparison evaluates the same current latent at a chosen
+            # sigma, never a trajectory whose evolving samples could diverge.
+            for index, sigma in enumerate(sigmas):
+                result = evaluate(x, torch.full((batch,), sigma), (0, index))
+            return result
+
+        leaf = host.leaf
+
+        def record_tiles(*args):
+            model_start = len(host.krea2_calls)
+            result = leaf(*args)
+            tile_outputs.append(result)
+            tile_model_calls.append(host.krea2_calls[model_start:])
+            return result
+
+        common_start, model_start, tile_start = (
+            len(host.common_calls),
+            len(host.krea2_calls),
+            len(host.tile_calls),
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(host, "leaf", record_tiles)
+            patch.setattr(host.dispatch["euler"], "sampler_function", solve)
+            output = TileSampler.execute(
+                **{key: [value] for key, value in args.items()}, local_positive=local
+            )[0]
+        assert len(host.common_calls) == common_start + 1
+        assert hooks == ["pre", "cfg", "post"] * len(sigmas)
+        for data in captures:
+            torch.testing.assert_close(
+                data["denoised"],
+                data["uncond_denoised"]
+                + cfg * (data["cond_denoised"] - data["uncond_denoised"]),
+            )
+        torch.testing.assert_close(output["samples"], captures[-1]["denoised"] + 0.125)
+        assert not args["model"].wrappers
+        assert not args["latent_image"]["samples"].any()
+        assert args["model"].model_options["sampler_cfg_function"] is guide
+        assert args["model"].model_options["sampler_post_cfg_function"] == [post]
+        assert all(
+            "tdng_tile_id" not in meta for entries in local for _, meta in entries
+        )
+        assert all(
+            refs is None for _, _, _, refs, _, _ in host.krea2_calls[model_start:]
+        )
+        return {
+            "captures": captures,
+            "model_calls": host.krea2_calls[model_start:],
+            "tile_calls": host.tile_calls[tile_start:],
+            "tile_outputs": tile_outputs,
+            "tile_model_calls": tile_model_calls,
+        }
+
+    return run
+
+
+def evaluated_contexts(run, sigma, branch, batch):
+    # Native batching can evaluate several condition entries in one forward.
+    # Count batch examples after schedule filtering, including CFG negatives.
+    examples = []
+    for x, timestep, context, _refs, _method, options in run["model_calls"]:
+        if timestep[0].item() != sigma:
+            continue
+        assert len(context) == len(x) == batch * len(options["cond_or_uncond"])
+        for index, branch_index in enumerate(options["cond_or_uncond"]):
+            if branch_index == branch:
+                examples.extend(context[index * batch : (index + 1) * batch])
+    return examples
 
 
 def tiles(height=6, width=10, channels=3):
@@ -74,11 +192,13 @@ def test_schema_and_execution_list_output(clip):
         "strength",
         "end_percent",
         "downsize_to_1mp",
+        "baseline",
     ]
-    assert inputs["prompts"].optional and inputs["prompts"].force_input
-    assert inputs["prompts"].dynamic_prompts is False
+    for name in ("prompts", "baseline"):
+        assert inputs[name].optional and inputs[name].force_input
+        assert inputs[name].dynamic_prompts is False
     for name, expected in (
-        ("strength", (1, 0, 3, 0.05)),
+        ("strength", (1, 0, 1, 0.05)),
         ("end_percent", (1, 0, 1, 0.001)),
     ):
         item = inputs[name]
@@ -155,75 +275,216 @@ def test_four_joint_encodes_keep_order_rgb_and_literal_prompts(clip, prompts, ch
     torch.testing.assert_close(source, before)
 
 
-@pytest.mark.parametrize("strength", [0, 0.25, 1, 1.75, 3])
+@pytest.mark.parametrize("prompts", [None, ["  {red|blue}  ", "", "lake", "{{bird}}"]])
+@pytest.mark.parametrize(
+    "baseline",
+    [
+        None,
+        [],
+        [""] * 4,
+        ["red", "bed", "lake", "bird"],
+        ["", "  {literal|braces} \n", "{{literal}}", ""],
+        ["same", "same", " same", "same "],
+    ],
+)
+def test_baseline_list_transport_and_independent_literal_encoding(
+    clip, prompts, baseline
+):
+    from tiled_diffusion_ng.nodes import TileKrea2Conditioning
+
+    prompts_before = None if prompts is None else prompts.copy()
+    baseline_before = None if baseline is None else baseline.copy()
+    output = TileKrea2Conditioning.execute(
+        **node_arguments(clip, strength=0.25, end_percent=0.5),
+        prompts=prompts,
+        baseline=baseline,
+    )[0]
+    texts = baseline or [""] * 4
+    distinct_texts = list(dict.fromkeys(texts))
+    assert len(clip.encoded) == 4 + len(distinct_texts)
+    assert [tokens["text"] for tokens in clip.tokenized[:4]] == [
+        VISION + prompt for prompt in (prompts or [""] * 4)
+    ]
+    assert [tokens["text"] for tokens in clip.tokenized[4:]] == distinct_texts
+    natives = dict(zip(distinct_texts, clip.outputs[4:], strict=True))
+    for tokens in clip.tokenized[4:]:
+        assert tokens["images"] == []
+        assert tokens["template"] == encoder_host.KREA2_TEMPLATE
+        assert tokens["rendered"] == encoder_host.KREA2_TEMPLATE.format(tokens["text"])
+    for index, (conditioning, text) in enumerate(zip(output, texts, strict=True)):
+        assert len(conditioning) == 3
+        assert conditioning[0][0] is clip.outputs[index][0][0]
+        assert conditioning[1][0] is conditioning[2][0] is natives[text][0][0]
+        assert [meta.get("strength", 1) for _, meta in conditioning] == [0.25, 0.75, 1]
+        assert (
+            conditioning[1][1]["start_percent"],
+            conditioning[1][1]["end_percent"],
+        ) == (
+            0,
+            0.5,
+        )
+        assert (
+            conditioning[2][1]["start_percent"],
+            conditioning[2][1]["end_percent"],
+        ) == (
+            0.5,
+            1,
+        )
+    assert len({entries[0][0].mean().item() for entries in natives.values()}) == len(
+        distinct_texts
+    )
+    assert prompts == prompts_before and baseline == baseline_before
+
+
+def test_same_list_can_supply_prompts_and_baseline_positionally(clip):
+    from tiled_diffusion_ng.nodes import TileKrea2Conditioning
+
+    texts = ["sun", "sea", "oak", "sky"]
+    source = tiles()
+    # The added optional argument follows every existing positional argument.
+    direct = encode_tiles(clip, source, texts, 0.5, 0.5, False, texts)
+    output = TileKrea2Conditioning.execute(
+        [clip], [source], [0.5], [0.5], [False], texts, texts
+    )[0]
+    torch.testing.assert_close(direct, output)
+    for offset in (0, 8):
+        assert [tokens["text"] for tokens in clip.tokenized[offset : offset + 8]] == [
+            *(VISION + text for text in texts),
+            *texts,
+        ]
+    assert texts == ["sun", "sea", "oak", "sky"]
+
+
+def test_baseline_cache_is_per_invocation_and_containers_are_independent(clip):
+    baseline = ["red", "bed", "red", "bed"]
+    original_attributes = set(clip.__dict__)
+    first = encode_tiles(
+        clip, tiles(), strength=0.5, end_percent=0.5, baseline=baseline
+    )
+    second = encode_tiles(
+        clip, tiles(), strength=0.5, end_percent=0.5, baseline=baseline
+    )
+    assert len(clip.encoded) == 12
+    assert [tokens["text"] for tokens in clip.encoded if not tokens["images"]] == [
+        "red",
+        "bed",
+        "red",
+        "bed",
+    ]
+    assert set(clip.__dict__) == original_attributes
+    torch.testing.assert_close(first, second)
+    for index in range(4):
+        assert first[index][1][0] is not second[index][1][0]
+        assert first[index][1][0] is first[index][2][0] is first[(index + 2) % 4][1][0]
+    entries = [entry for result in (first, second) for tile in result for entry in tile]
+    assert len({id(entry) for entry in entries}) == len(entries)
+    assert len({id(entry[1]) for entry in entries}) == len(entries)
+    first[0][1][1]["changed"] = True
+    assert all(
+        "changed" not in entry[1] for entry in entries if entry is not first[0][1]
+    )
+    assert all("changed" not in meta for output in clip.outputs for _, meta in output)
+
+
+@pytest.mark.parametrize("strength", [0, 0.25, 0.5, 1])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_strength_scales_every_entry_without_mutation(clip, strength, dtype):
+def test_prediction_weights_preserve_native_tensors_and_metadata(clip, strength, dtype):
     clip.dtype = dtype
     marker = object()
     clip.schedules = [
         {"clip_start_percent": 0, "clip_end_percent": 0.5, "opaque": marker},
         {"clip_start_percent": 0.5, "clip_end_percent": 1, "strength": 0.7},
     ]
-    baseline = encode_tiles(clip, tiles())
-    result = encode_tiles(clip, tiles(), strength=strength)
-    for expected, actual, native in zip(
-        baseline, result, clip.outputs[4:], strict=True
-    ):
-        assert len(actual) == 2
-        for before, after, original in zip(expected, actual, native, strict=True):
-            torch.testing.assert_close(original[0], before[0])
-            torch.testing.assert_close(after[0], before[0] * strength)
-            assert after[0].dtype == dtype
-            assert (after[0] is original[0]) == (strength == 1)
-            assert after[1] is not original[1]
-            assert after[1].keys() == original[1].keys()
-            assert all(after[1][key] is value for key, value in original[1].items())
-            if strength == 0:
-                assert not after[0].any()
+    result = encode_tiles(clip, tiles(), strength=strength, baseline=["baseline"] * 4)
+    assert len(clip.encoded) == (1 if strength == 0 else 4 if strength == 1 else 5)
+    for index, actual in enumerate(result):
+        sources = (
+            [(clip.outputs[0], 1)]
+            if strength == 0
+            else [(clip.outputs[index], 1)]
+            if strength == 1
+            else [(clip.outputs[index], strength), (clip.outputs[-1], 1 - strength)]
+        )
+        assert len(actual) == 2 * len(sources)
+        for group, (native, weight) in enumerate(sources):
+            for (embedding, meta), (original, original_meta) in zip(
+                actual[group * 2 : group * 2 + 2], native, strict=True
+            ):
+                assert embedding is original and embedding.dtype == dtype
+                assert embedding.any()
+                assert meta is not original_meta
+                expected = original_meta.copy()
+                if weight != 1:
+                    expected["strength"] = original_meta.get("strength", 1) * weight
+                assert meta.keys() == expected.keys()
+                for key, value in expected.items():
+                    if key == "strength":
+                        assert meta[key] == value
+                        if weight == 1:
+                            assert meta[key] is original_meta[key]
+                    else:
+                        assert meta[key] is value
+    assert all(
+        "strength" not in native[0][1] and native[1][1]["strength"] == 0.7
+        for native in clip.outputs
+    )
 
 
 @pytest.mark.parametrize("cutoff", [0, 0.35, 1])
-def test_cutoff_shared_unscaled_fallback_and_independent_containers(clip, cutoff):
+@pytest.mark.parametrize("strength", [0, 0.25, 1])
+def test_cutoff_baselines_have_independent_containers(clip, cutoff, strength):
     clip.schedules = [
         {"clip_start_percent": 0, "clip_end_percent": 0.5},
         {"clip_start_percent": 0.5, "clip_end_percent": 1},
     ]
     output = encode_tiles(
-        clip, tiles(), ["tile text"] * 4, strength=0, end_percent=cutoff
+        clip, tiles(), ["tile text"] * 4, strength=strength, end_percent=cutoff
     )
-    assert len(clip.encoded) == (1 if cutoff == 0 else 4 if cutoff == 1 else 5)
+    baseline_only = cutoff == 0 or strength == 0
+    has_baseline = baseline_only or strength < 1 or cutoff < 1
+    assert len(clip.encoded) == (1 if baseline_only else 4 + has_baseline)
     assert len(output) == 4
-    for conditioning in output:
-        assert len(conditioning) == (4 if 0 < cutoff < 1 else 2)
-        if cutoff > 0:
-            assert not conditioning[0][0].any() and not conditioning[1][0].any()
-        if cutoff < 1:
-            fallback = conditioning[-2:]
-            assert (
-                clip.tokenized[-1]["text"] == "" and clip.tokenized[-1]["images"] == []
-            )
-            assert clip.tokenized[-1]["template"] == encoder_host.KREA2_TEMPLATE
-            for (embedding, meta), (native, original_meta) in zip(
-                fallback, clip.outputs[-1], strict=True
+    if has_baseline:
+        assert clip.tokenized[-1]["text"] == ""
+        assert clip.tokenized[-1]["images"] == []
+        assert clip.tokenized[-1]["template"] == encoder_host.KREA2_TEMPLATE
+    for index, conditioning in enumerate(output):
+        if baseline_only:
+            groups = [(clip.outputs[-1], 1, None)]
+        else:
+            interval = (0, cutoff) if cutoff < 1 else None
+            groups = [(clip.outputs[index], strength, interval)]
+            if strength < 1:
+                groups.append((clip.outputs[-1], 1 - strength, interval))
+            if cutoff < 1:
+                groups.append((clip.outputs[-1], 1, (cutoff, 1)))
+        assert len(conditioning) == 2 * len(groups)
+        for group, (native, weight, interval) in enumerate(groups):
+            for (embedding, meta), (original, original_meta) in zip(
+                conditioning[group * 2 : group * 2 + 2], native, strict=True
             ):
-                assert embedding is native and embedding.any()
+                assert embedding is original and embedding.any()
+                assert meta.get("strength", 1) == weight
                 assert meta["clip_start_percent"] == original_meta["clip_start_percent"]
                 assert meta["clip_end_percent"] == original_meta["clip_end_percent"]
-                if cutoff > 0:
-                    assert (meta["start_percent"], meta["end_percent"]) == (cutoff, 1)
-            if cutoff > 0:
-                for _, meta in conditioning[:2]:
-                    assert (meta["start_percent"], meta["end_percent"]) == (0, cutoff)
-    for position in range(len(output[0])):
-        assert len({id(conditioning[position]) for conditioning in output}) == 4
-        assert len({id(conditioning[position][1]) for conditioning in output}) == 4
+                if interval is None:
+                    assert "start_percent" not in meta and "end_percent" not in meta
+                else:
+                    assert (meta["start_percent"], meta["end_percent"]) == interval
+    entries = [entry for conditioning in output for entry in conditioning]
+    assert len({id(conditioning) for conditioning in output}) == 4
+    assert len({id(entry) for entry in entries}) == len(entries)
+    assert len({id(entry[1]) for entry in entries}) == len(entries)
     output[0][0][1]["changed"] = True
     output[0].append([None, {}])
     assert all("changed" not in conditioning[0][1] for conditioning in output[1:])
     assert all("changed" not in entries[0][1] for entries in clip.outputs)
 
 
-def test_cutoff_intersects_existing_ranges_without_rewriting_clip_schedule(clip):
+@pytest.mark.parametrize("cutoff", [0.5, 1])
+def test_cutoff_intersects_existing_ranges_without_rewriting_clip_schedule(
+    clip, cutoff
+):
     clip.schedules = [
         {
             "start_percent": 0.2,
@@ -232,11 +493,11 @@ def test_cutoff_intersects_existing_ranges_without_rewriting_clip_schedule(clip)
             "clip_end_percent": 0.7,
         }
     ]
-    result = encode_tiles(clip, tiles(), end_percent=0.5)
+    result = encode_tiles(clip, tiles(), strength=0.5, end_percent=cutoff)
     for conditioning in result:
         assert [
             (meta["start_percent"], meta["end_percent"]) for _, meta in conditioning
-        ] == [(0.2, 0.5), (0.5, 0.8)]
+        ] == ([(0.2, 0.5), (0.2, 0.5), (0.5, 0.8)] if cutoff < 1 else [(0.2, 0.8)] * 2)
         assert all(
             (meta["clip_start_percent"], meta["clip_end_percent"]) == (0.3, 0.7)
             for _, meta in conditioning
@@ -348,15 +609,56 @@ def test_real_bicubic_keeps_rgb_range_at_sharp_edges(clip):
     torch.testing.assert_close(source, before, rtol=0, atol=0)
 
 
-def test_zero_cutoff_skips_tile_resize_and_encoding(clip, monkeypatch):
+@pytest.mark.parametrize(
+    "strength,cutoff", [(0, 0), (0, 0.5), (0, 1), (0.5, 0), (1, 0)]
+)
+@pytest.mark.parametrize("baseline", [None, ["red", "bed", "red", ""]])
+def test_baseline_endpoints_skip_tile_preparation(
+    clip, monkeypatch, strength, cutoff, baseline
+):
+    from tiled_diffusion_ng import _krea2_conditioning
+
     def unexpected_resize(*args, **kwargs):
-        pytest.fail("Zero cutoff must only encode the empty-prompt fallback")
+        pytest.fail("Baseline-only endpoints must skip image preparation")
 
     monkeypatch.setattr(F, "interpolate", unexpected_resize)
-    encode_tiles(
-        clip, tiles(1, 1).expand(4, 2048, 2048, 3), end_percent=0, downsize_to_1mp=True
+    monkeypatch.setattr(_krea2_conditioning, "_image", unexpected_resize)
+    result = encode_tiles(
+        clip,
+        tiles(1, 1).expand(4, 2048, 2048, 3),
+        strength=strength,
+        end_percent=cutoff,
+        downsize_to_1mp=True,
+        baseline=baseline,
     )
-    assert len(clip.tokenized) == 1 and not clip.tokenized[0]["images"]
+    assert len(clip.tokenized) == len(set(baseline or [""]))
+    assert all(not tokens["images"] for tokens in clip.tokenized)
+    assert all(len(conditioning) == 1 for conditioning in result)
+    assert all(
+        "strength" not in meta
+        and "start_percent" not in meta
+        and "end_percent" not in meta
+        for conditioning in result
+        for _, meta in conditioning
+    )
+
+
+def test_full_reference_endpoint_skips_custom_baseline_encodes(clip):
+    encode_tiles(clip, tiles(), baseline=["unused"] * 4)
+    assert len(clip.encoded) == 4
+    assert all(tokens["images"] for tokens in clip.encoded)
+
+
+@pytest.mark.parametrize(
+    "strength", [math.nextafter(0.0, 1.0), math.nextafter(1.0, 0.0)]
+)
+def test_near_endpoint_strengths_are_not_snapped(clip, strength):
+    output = encode_tiles(clip, tiles(), strength=strength)
+    assert len(clip.encoded) == 5
+    for conditioning in output:
+        assert len(conditioning) == 2
+        assert conditioning[0][1]["strength"] == strength
+        assert conditioning[1][1].get("strength", 1) == 1 - strength
 
 
 @pytest.mark.parametrize(
@@ -380,19 +682,39 @@ def test_zero_cutoff_skips_tile_resize_and_encoding(clip, monkeypatch):
         lambda: tiles().to_sparse(),
     ],
 )
-def test_invalid_images_fail_before_encoding(clip, make_bad):
+@pytest.mark.parametrize("settings", [{}, {"strength": 0}, {"end_percent": 0}])
+def test_invalid_images_fail_before_encoding(clip, make_bad, settings):
     with pytest.raises(ValueError, match="reference_tiles"):
-        encode_tiles(clip, make_bad(), end_percent=0)
+        encode_tiles(clip, make_bad(), **settings)
     assert not clip.tokenized
 
 
 @pytest.mark.parametrize(
-    "prompts",
-    ["text", ["one"], [""] * 3, [""] * 5, ("",) * 4, ["", "", "", None], [[""]] * 4],
+    "value",
+    [
+        "",
+        "text",
+        (),
+        ["one"],
+        [""] * 3,
+        [""] * 5,
+        ("",) * 4,
+        ["", "", "", None],
+        [1] * 4,
+        [[""]] * 4,
+    ],
 )
-def test_invalid_prompts_fail_before_encoding_even_at_zero_cutoff(clip, prompts):
-    with pytest.raises(ValueError, match="prompts requires exactly four"):
-        encode_tiles(clip, tiles(), prompts=prompts, end_percent=0)
+@pytest.mark.parametrize("name", ["prompts", "baseline"])
+@pytest.mark.parametrize("settings", [{}, {"strength": 0}, {"end_percent": 0}])
+def test_invalid_string_lists_fail_before_encoding_even_at_endpoints(
+    clip, name, value, settings
+):
+    from tiled_diffusion_ng.nodes import TileKrea2Conditioning
+
+    with pytest.raises(ValueError, match=name + " requires exactly four"):
+        TileKrea2Conditioning.execute(
+            **node_arguments(clip, **settings), **{name: value}
+        )
     assert not clip.tokenized
 
 
@@ -406,6 +728,9 @@ def test_invalid_prompts_fail_before_encoding_even_at_zero_cutoff(clip, prompts)
             float("inf"),
             -float("inf"),
             -0.1,
+            1.001,
+            1.75,
+            3,
             3.1,
             True,
             "1",
@@ -414,15 +739,15 @@ def test_invalid_prompts_fail_before_encoding_even_at_zero_cutoff(clip, prompts)
         )
     ]
     + [
-        ("end_percent", 1.001),
         ("downsize_to_1mp", 1),
         ("downsize_to_1mp", "false"),
         ("downsize_to_1mp", None),
     ],
 )
-def test_invalid_settings_fail_before_encoding(clip, name, value):
+@pytest.mark.parametrize("settings", [{}, {"strength": 0}, {"end_percent": 0}])
+def test_invalid_settings_fail_before_encoding(clip, name, value, settings):
     with pytest.raises(ValueError, match=name):
-        encode_tiles(clip, tiles(), **{name: value})
+        encode_tiles(clip, tiles(), **{**settings, name: value})
     assert not clip.tokenized
 
 
@@ -447,10 +772,11 @@ def test_optional_apis_fail_only_when_executing_helper(clip, monkeypatch, missin
     "field",
     ["cond_stage_model", "tokenizer", "tokenize", "encode_from_tokens_scheduled"],
 )
-def test_incompatible_clip_rejected(clip, field):
+@pytest.mark.parametrize("strength", [0, 1])
+def test_incompatible_clip_rejected(clip, field, strength):
     setattr(clip, field, object())
     with pytest.raises(ValueError, match="native Krea2 CLIP"):
-        encode_tiles(clip, tiles())
+        encode_tiles(clip, tiles(), strength=strength, baseline=["custom"] * 4)
     assert not clip.tokenized
 
 
@@ -470,10 +796,11 @@ def test_missing_template_capability_rejected(clip, monkeypatch, template):
 
 
 @pytest.mark.parametrize("bad", [None, [], {}, [[None]], [[None, []]]])
-def test_malformed_native_conditioning_rejected(clip, monkeypatch, bad):
+@pytest.mark.parametrize("strength", [0, 1])
+def test_malformed_native_conditioning_rejected(clip, monkeypatch, bad, strength):
     monkeypatch.setattr(clip, "encode_from_tokens_scheduled", lambda tokens: bad)
     with pytest.raises(ValueError, match="Native Krea2 encoding must return"):
-        encode_tiles(clip, tiles())
+        encode_tiles(clip, tiles(), strength=strength, baseline=["custom"] * 4)
 
 
 @pytest.mark.parametrize(
@@ -496,15 +823,29 @@ def test_native_output_dimensions_checked_including_fallback(
         clip, "encode_from_tokens_scheduled", lambda tokens: [[make_bad(), {}]]
     )
     with pytest.raises(ValueError, match=r"\[1, tokens, 30720\]"):
-        encode_tiles(clip, tiles(), end_percent=cutoff)
+        encode_tiles(clip, tiles(), end_percent=cutoff, baseline=["custom"] * 4)
+
+
+def test_invalid_baseline_output_is_checked_after_reference_encodes(clip, monkeypatch):
+    encode = clip.encode_from_tokens_scheduled
+
+    def invalid_baseline(tokens):
+        return encode(tokens) if tokens["images"] else [[torch.ones(1, 1, 2560), {}]]
+
+    monkeypatch.setattr(clip, "encode_from_tokens_scheduled", invalid_baseline)
+    with pytest.raises(ValueError, match=r"\[1, tokens, 30720\]"):
+        encode_tiles(clip, tiles(), strength=0.5, baseline=["custom"] * 4)
+    assert len(clip.encoded) == 4
 
 
 @pytest.mark.parametrize(
     "method,fail_at",
     [
         ("tokenize", 3),
+        ("tokenize", 6),
         ("encode_from_tokens_scheduled", 3),
         ("encode_from_tokens_scheduled", 5),
+        ("encode_from_tokens_scheduled", 6),
     ],
 )
 @pytest.mark.parametrize(
@@ -515,6 +856,14 @@ def test_failure_and_cancellation_leave_inputs_reusable(
 ):
     source = tiles()
     before = source.clone()
+    prompts = ["reference"] * 4
+    baseline = ["custom", "{literal} ", "custom", ""]
+    settings = {
+        "prompts": prompts,
+        "strength": 0.5,
+        "end_percent": 0.5,
+        "baseline": baseline,
+    }
     original = getattr(clip, method)
     calls = 0
 
@@ -528,29 +877,38 @@ def test_failure_and_cancellation_leave_inputs_reusable(
     with monkeypatch.context() as patch:
         patch.setattr(clip, method, fail)
         with pytest.raises(exception, match="deliberate encode failure"):
-            encode_tiles(clip, source, end_percent=0.5)
-    result = encode_tiles(clip, source, end_percent=0.5)
-    repeat = encode_tiles(clip, source, end_percent=0.5)
-    for first, second in zip(result, repeat, strict=True):
-        for (left, _), (right, _) in zip(first, second, strict=True):
-            torch.testing.assert_close(left, right)
+            encode_tiles(clip, source, **settings)
+    encodes_before = len(clip.encoded)
+    result = encode_tiles(clip, source, **settings)
+    repeat = encode_tiles(clip, source, **settings)
+    assert len(clip.encoded) == encodes_before + 14
+    torch.testing.assert_close(result, repeat)
     torch.testing.assert_close(source, before)
+    assert baseline == ["custom", "{literal} ", "custom", ""]
+    assert prompts == ["reference"] * 4
     assert all(
         "start_percent" not in meta for entries in clip.outputs for _, meta in entries
     )
 
 
-def test_host_cancellation_is_checked_between_encodes(clip, host):
-    host.interrupt_after = 5
+@pytest.mark.parametrize("interrupt_after", [5, 9, 10, 11, 12])
+def test_host_cancellation_is_checked_between_encodes(clip, host, interrupt_after):
+    host.interrupt_after = interrupt_after
+    settings = {"strength": 0.5, "baseline": ["red", "bed", "lake", "bird"]}
     with pytest.raises(InterruptedError, match="cancelled"):
-        encode_tiles(clip, tiles())
-    assert len(clip.encoded) == 2
+        encode_tiles(clip, tiles(), **settings)
+    assert len(clip.encoded) == interrupt_after // 2
     host.interrupt_after = None
-    assert len(encode_tiles(clip, tiles())) == 4
+    encodes_before = len(clip.encoded)
+    assert len(encode_tiles(clip, tiles(), **settings)) == 4
+    assert len(clip.encoded) == encodes_before + 8
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_invocation_tensors_are_released(clip, monkeypatch, fail):
+@pytest.mark.parametrize(
+    "failure", [None, RuntimeError, InterruptedError, asyncio.CancelledError]
+)
+@pytest.mark.parametrize("fail_at", [3, 6])
+def test_invocation_tensors_are_released(clip, monkeypatch, failure, fail_at):
     references = []
     calls = 0
 
@@ -561,19 +919,28 @@ def test_invocation_tensors_are_released(clip, monkeypatch, fail):
     def encode(tokens):
         nonlocal calls
         calls += 1
-        if fail and calls == 3:
-            raise RuntimeError("failure")
+        if failure and calls == fail_at:
+            raise failure("failure")
         embedding = torch.ones(1, 1, 30720)
-        references.append(weakref.ref(embedding))
-        return [[embedding, {}]]
+        pooled = torch.ones(1, 30720)
+        mask = torch.ones(1, 1)
+        references.extend(weakref.ref(tensor) for tensor in (embedding, pooled, mask))
+        return [[embedding, {"pooled_output": pooled, "attention_mask": mask}]]
 
     monkeypatch.setattr(clip, "tokenize", tokenize)
     monkeypatch.setattr(clip, "encode_from_tokens_scheduled", encode)
     try:
-        result = encode_tiles(clip, tiles(), end_percent=0.5)
+        result = encode_tiles(
+            clip,
+            tiles(),
+            strength=0.5,
+            end_percent=0.5,
+            baseline=["red", "bed", "lake", "bird"],
+        )
         del result
-    except RuntimeError:
-        assert fail
+    except (RuntimeError, InterruptedError, asyncio.CancelledError):
+        assert failure is not None
+    assert calls == (8 if failure is None else fail_at)
     gc.collect()
     assert references and all(reference() is None for reference in references)
 
@@ -618,43 +985,152 @@ def test_tileview_to_helper_to_sampler_has_one_trajectory(clip, host):
     assert all(refs is None for _, _, _, refs, _, _ in host.krea2_calls)
 
 
-def test_native_cutoff_boundary_and_clip_schedule_intersections(clip, host):
-    from tiled_diffusion_ng.nodes import TileSampler
-
-    clip.schedules = [
-        {"clip_start_percent": 0, "clip_end_percent": 0.25},
-        {"clip_start_percent": 0.25, "clip_end_percent": 1},
-    ]
-    local = encode_tiles(clip, tiles(), strength=0.5, end_percent=0.5)
-    args = sampler_arguments(cfg=1, negative=cond(0, width=30720))
-    args["model"].model.diffusion_model.txtdim = 2560
-
-    def solve(evaluate, x, sigmas):
-        for index, sigma in enumerate((0.875, 0.625, 0.5, 0.375)):
-            x = evaluate(x, torch.tensor([sigma]), (0, index))
-        return x
-
-    host.dispatch["euler"].sampler_function = solve
-    TileSampler.execute(
-        **{key: [value] for key, value in args.items()}, local_positive=local
+@pytest.mark.parametrize("strength", [0, 0.25, 0.5, 1])
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("cfg", [1, 4.5])
+@pytest.mark.parametrize("baseline", [None, ["", "bed", "red", "lake"]])
+def test_blend_matches_independent_nonlinear_predictions(
+    clip, predictions, strength, batch, cfg, baseline
+):
+    settings = {"prompts": ["red", "reed", "tall", "blue"], "baseline": baseline}
+    reference = encode_tiles(clip, tiles(), **settings)
+    text_only = encode_tiles(clip, tiles(), strength=0, **settings)
+    local = encode_tiles(clip, tiles(), strength=strength, **settings)
+    assert all(
+        reference[index][0][0].shape[1] != text_only[index][0][0].shape[1]
+        for index in range(4)
     )
-    assert len(host.common_calls) == 1 and len(host.tile_calls) == 16
-    for step, indices in enumerate(((0,), (1,), (1, 3), (3,))):
-        for tile in range(4):
-            branches, _, sigma, _ = host.tile_calls[step * 4 + tile]
-            active = [
-                entry["cross_attn"]
-                for entry in branches[0]
-                if entry["timestep_end"] <= sigma[0] <= entry["timestep_start"]
-            ]
-            assert len(active) == len(indices)
-            assert all(
-                embedding is local[tile][index][0]
-                for embedding, index in zip(active, indices, strict=True)
+    p = predictions(reference, batch=batch, cfg=cfg)
+    b = predictions(text_only, batch=batch, cfg=cfg)
+    actual = predictions(local, batch=batch, cfg=cfg)
+    for index in range(4):
+        torch.testing.assert_close(
+            actual["tile_outputs"][index][0],
+            strength * p["tile_outputs"][index][0]
+            + (1 - strength) * b["tile_outputs"][index][0],
+        )
+        for source in (p, b):
+            torch.testing.assert_close(
+                actual["tile_calls"][index][1], source["tile_calls"][index][1]
             )
-    # Inclusive cutoff admits both the scaled image/text and unscaled fallback.
+            torch.testing.assert_close(
+                actual["tile_calls"][index][2], source["tile_calls"][index][2]
+            )
+    for key in ("cond_denoised", "denoised"):
+        torch.testing.assert_close(
+            actual["captures"][0][key],
+            strength * p["captures"][0][key] + (1 - strength) * b["captures"][0][key],
+        )
+    for model_calls in actual["tile_model_calls"]:
+        per_tile = {"model_calls": model_calls}
+        assert len(evaluated_contexts(per_tile, 0.625, 0, batch)) == batch * (
+            2 if 0 < strength < 1 else 1
+        )
+        assert len(evaluated_contexts(per_tile, 0.625, 1, batch)) == (
+            batch if cfg > 1 else 0
+        )
+
+
+@pytest.mark.parametrize("strength", [0.25, 0.5, 1])
+@pytest.mark.parametrize("batch,cfg", [(1, 1), (2, 4.5)])
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_cutoff_filters_model_examples_and_matches_baseline_afterward(
+    clip, predictions, strength, batch, cfg, scheduled
+):
+    if scheduled:
+        clip.schedules = [
+            {"clip_start_percent": 0, "clip_end_percent": 0.25},
+            {"clip_start_percent": 0.25, "clip_end_percent": 1},
+        ]
+    settings = {
+        "prompts": ["red", "reed", "tall", "blue"],
+        "baseline": ["", "bed", "red", "lake"],
+    }
+    reference = encode_tiles(clip, tiles(), **settings)
+    text_only = encode_tiles(clip, tiles(), strength=0, **settings)
+    local = encode_tiles(clip, tiles(), strength=strength, end_percent=0.5, **settings)
+    sigmas = (0.875, 0.75, 0.625, 0.5, 0.375)
+    p = predictions(reference, batch=batch, cfg=cfg, sigmas=sigmas)
+    b = predictions(text_only, batch=batch, cfg=cfg, sigmas=sigmas)
+    actual = predictions(local, batch=batch, cfg=cfg, sigmas=sigmas)
+    assert len(actual["tile_calls"]) == 4 * len(sigmas)
+    for step, sigma in enumerate(sigmas):
+        # Both intervals include the cutoff: s*P + (1-s)*B + B is
+        # normalized by 2. The extra baseline may batch with the active one.
+        coefficient = strength if sigma > 0.5 else strength / 2 if sigma == 0.5 else 0
+        entries = (
+            (1 + (strength < 1))
+            if sigma > 0.5
+            else (2 + (strength < 1))
+            if sigma == 0.5
+            else 1
+        )
+        if scheduled and sigma == 0.75:
+            entries *= 2  # Both baked CLIP entries also include their boundary.
+        for key in ("cond_denoised", "denoised"):
+            torch.testing.assert_close(
+                actual["captures"][step][key],
+                coefficient * p["captures"][step][key]
+                + (1 - coefficient) * b["captures"][step][key],
+            )
+        for tile in range(4):
+            index = step * 4 + tile
+            torch.testing.assert_close(
+                actual["tile_outputs"][index][0],
+                coefficient * p["tile_outputs"][index][0]
+                + (1 - coefficient) * b["tile_outputs"][index][0],
+            )
+            per_tile = {"model_calls": actual["tile_model_calls"][index]}
+            positive = evaluated_contexts(per_tile, sigma, 0, batch)
+            assert len(positive) == entries * batch
+            assert len(evaluated_contexts(per_tile, sigma, 1, batch)) == (
+                batch if cfg > 1 else 0
+            )
+            if sigma < 0.5:
+                baseline_calls = {"model_calls": b["tile_model_calls"][index]}
+                expected = evaluated_contexts(baseline_calls, sigma, 0, batch)
+                torch.testing.assert_close(positive, expected, rtol=0, atol=0)
+                for context in positive:
+                    assert not any(
+                        torch.equal(context, embedding[0])
+                        for embedding, _ in reference[tile]
+                    )
+                assert sum(len(call[0]) for call in per_tile["model_calls"]) == sum(
+                    len(call[0]) for call in baseline_calls["model_calls"]
+                )
+    if strength < 1:
+        assert any(
+            len(x) > batch for x, sigma, *_ in actual["model_calls"] if sigma[0] == 0.5
+        )
     assert all(
         "timestep_start" not in meta
         for conditioning in local
         for _, meta in conditioning
     )
+
+
+@pytest.mark.parametrize(
+    "strength,cutoff", [(0, 0), (0, 0.5), (0, 1), (0.5, 0), (1, 0), (1, 1)]
+)
+def test_endpoint_optimizations_evaluate_only_selected_source(
+    clip, predictions, strength, cutoff
+):
+    local = encode_tiles(
+        clip,
+        tiles(),
+        strength=strength,
+        end_percent=cutoff,
+        baseline=["red", "bed", "red", ""],
+    )
+    reference_only = strength == cutoff == 1
+    assert len(clip.encoded) == (4 if reference_only else 3)
+    assert all(bool(tokens["images"]) == reference_only for tokens in clip.encoded)
+    actual = predictions(local, batch=2, sigmas=(0.75, 0.5, 0.25))
+    for sigma in (0.75, 0.5, 0.25):
+        contexts = evaluated_contexts(actual, sigma, 0, 2)
+        assert len(contexts) == 8
+        assert all(
+            any(torch.equal(context, entries[0][0][0]) for entries in local)
+            for context in contexts
+        )
+        assert not evaluated_contexts(actual, sigma, 1, 2)

@@ -75,7 +75,20 @@ class Clip:
     def encode_from_tokens_scheduled(self, tokens):
         self.encoded.append(tokens)
         images = tokens["images"]
-        value = images[0].mean().item() * 10 + len(tokens["text"]) if images else -2
+        # Text-only baselines must distinguish literal strings, even when their
+        # lengths match. Empty text retains the original nonzero native value.
+        text_value = (
+            sum(
+                (index + 1) * ord(character)
+                for index, character in enumerate(tokens["text"])
+            )
+            / 1000
+        )
+        value = (
+            images[0].mean().item() * 10 + len(tokens["text"]) + text_value
+            if images
+            else -2 + text_value
+        )
         token_count = len(tokens["text"]) % 3 + 1
         basis = torch.arange(30720, dtype=torch.float32).reshape(1, 1, -1) / 30720
         entries = []

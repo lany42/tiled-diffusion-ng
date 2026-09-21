@@ -42,7 +42,24 @@ def _native_template(clip):
     return KREA2_TEMPLATE
 
 
-def _validate_inputs(reference_tiles, prompts, strength, end_percent, downsize_to_1mp):
+def _strings(values, name):
+    if values is None or (isinstance(values, list) and not values):
+        return [""] * 4
+    if (
+        not isinstance(values, list)
+        or len(values) != 4
+        or any(not isinstance(value, str) for value in values)
+    ):
+        raise ValueError(
+            f"{name} requires exactly four STRING execution-list items in "
+            "TL/TR/BR/BL order, or an absent/empty list for four empty strings"
+        )
+    return values
+
+
+def _validate_inputs(
+    reference_tiles, prompts, strength, end_percent, downsize_to_1mp, baseline
+):
     if (
         not isinstance(reference_tiles, torch.Tensor)
         or reference_tiles.is_nested
@@ -57,19 +74,10 @@ def _validate_inputs(reference_tiles, prompts, strength, end_percent, downsize_t
             "reference_tiles requires one floating RGB/RGBA IMAGE tensor with "
             "exactly four nonempty tiles in TL/TR/BR/BL order"
         )
-    if prompts is None or (isinstance(prompts, list) and not prompts):
-        prompts = [""] * 4
-    if (
-        not isinstance(prompts, list)
-        or len(prompts) != 4
-        or any(not isinstance(prompt, str) for prompt in prompts)
-    ):
-        raise ValueError(
-            "prompts requires exactly four STRING execution-list items in "
-            "TL/TR/BR/BL order, or an absent/empty list for image-only encoding"
-        )
+    prompts = _strings(prompts, "prompts")
+    baseline = _strings(baseline, "baseline")
     for name, value, upper in (
-        ("strength", strength, 3),
+        ("strength", strength, 1),
         ("end_percent", end_percent, 1),
     ):
         if (
@@ -81,7 +89,7 @@ def _validate_inputs(reference_tiles, prompts, strength, end_percent, downsize_t
             raise ValueError(f"{name} must be finite and in 0…{upper}")
     if not isinstance(downsize_to_1mp, bool):
         raise ValueError("downsize_to_1mp must be a boolean")  # noqa: TRY004
-    return prompts
+    return prompts, baseline
 
 
 def _image(tile, downsize_to_1mp):
@@ -142,10 +150,14 @@ def _encode(clip, template, text, images):
     return conditioning
 
 
-def _copy_conditioning(conditioning, strength=1.0, interval=None):
+def _copy_conditioning(conditioning, weight=1.0, interval=None):
     result = []
     for embedding, metadata in conditioning:
         metadata = metadata.copy()
+        if weight != 1:
+            # The host weights separate predictions, then normalizes their sum.
+            # Scaling embeddings or weighting a lone entry cannot form a blend.
+            metadata["strength"] = metadata.get("strength", 1) * weight
         if interval is not None:
             # Native percent-to-sigma conversion intersects these values with
             # clip_start/end_percent and includes both endpoints at the cutoff.
@@ -153,7 +165,7 @@ def _copy_conditioning(conditioning, strength=1.0, interval=None):
                 metadata.get("start_percent", 0), interval[0]
             )
             metadata["end_percent"] = min(metadata.get("end_percent", 1), interval[1])
-        result.append([embedding if strength == 1 else embedding * strength, metadata])
+        result.append([embedding, metadata])
     return result
 
 
@@ -164,14 +176,23 @@ def encode_tiles(
     strength=1.0,
     end_percent=1.0,
     downsize_to_1mp=False,
+    baseline=None,
 ):
-    prompts = _validate_inputs(
-        reference_tiles, prompts, strength, end_percent, downsize_to_1mp
+    prompts, baseline = _validate_inputs(
+        reference_tiles, prompts, strength, end_percent, downsize_to_1mp, baseline
     )
     template = _native_template(clip)
-    if end_percent == 0:
-        fallback = _encode(clip, template, "", [])
-        return [_copy_conditioning(fallback) for _ in range(4)]
+    baselines = {}
+
+    def text_conditioning(text):
+        # Invocation-local, keyed by literal text. Only tensors are shared;
+        # every tile and interval receives fresh conditioning containers below.
+        if text not in baselines:
+            baselines[text] = _encode(clip, template, text, [])
+        return baselines[text]
+
+    if strength == 0 or end_percent == 0:
+        return [_copy_conditioning(text_conditioning(text)) for text in baseline]
 
     result = []
     interval = (0, end_percent) if end_percent < 1 else None
@@ -180,8 +201,15 @@ def encode_tiles(
         conditioning = _encode(clip, template, VISION_TURN + prompt, [image])
         result.append(_copy_conditioning(conditioning, strength, interval))
 
-    if end_percent < 1:
-        fallback = _encode(clip, template, "", [])
-        for conditioning in result:
-            conditioning.extend(_copy_conditioning(fallback, interval=(end_percent, 1)))
+    if strength < 1 or end_percent < 1:
+        for conditioning, text in zip(result, baseline, strict=True):
+            fallback = text_conditioning(text)
+            if strength < 1:
+                conditioning.extend(
+                    _copy_conditioning(fallback, 1 - strength, interval)
+                )
+            if end_percent < 1:
+                conditioning.extend(
+                    _copy_conditioning(fallback, interval=(end_percent, 1))
+                )
     return result

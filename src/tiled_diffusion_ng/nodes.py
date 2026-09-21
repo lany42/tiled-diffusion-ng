@@ -118,6 +118,10 @@ class TileKrea2Conditioning(io.ComfyNode):
             category=CATEGORY,
             description=(
                 "Jointly encode exactly four TileView images and optional texts with native Krea2 CLIP. "
+                "Blend reference predictions with text-only baseline predictions: 0 selects baseline, 1 selects reference conditioning. "
+                "Baseline defaults to a native empty-prompt embedding and also applies after end_percent. "
+                "Intermediate strengths require additional model work during the active interval. "
+                "end_percent follows the native diffusion schedule; 0.5 does not guarantee half the steps or wall-clock time. "
                 "Returns four complete local positives in TL/TR/BR/BL order for TileSampler. "
                 "These replace the global positive, including its reference metadata. "
                 "This node produces vision conditioning without VAE reference latents."
@@ -137,9 +141,9 @@ class TileKrea2Conditioning(io.ComfyNode):
                     "strength",
                     default=1.0,
                     min=0.0,
-                    max=3.0,
+                    max=1.0,
                     step=0.05,
-                    tooltip="Scale the complete image/text embedding amplitude. Visual effects depend on the model; 0 zeros the embeddings, 1 preserves native output.",
+                    tooltip="Blend model predictions: 0 selects baseline, 1 selects reference image/text conditioning. Intermediate strengths require additional model work during the active interval.",
                 ),
                 io.Float.Input(
                     "end_percent",
@@ -147,12 +151,19 @@ class TileKrea2Conditioning(io.ComfyNode):
                     min=0.0,
                     max=1.0,
                     step=0.001,
-                    tooltip="After this diffusion percentage, use unscaled empty-prompt conditioning with no tile image or text. Native scheduling includes both entries at the exact cutoff.",
+                    tooltip="After this native diffusion percentage, use only the selected text-only baseline. 0.5 does not guarantee half the steps or wall-clock time. Native scheduling includes both intervals at the exact cutoff.",
                 ),
                 io.Boolean.Input(
                     "downsize_to_1mp",
                     default=False,
                     tooltip="Downsize tiles larger than 1024² pixels with antialiased bicubic, preserving aspect ratio and floating-point pixels. Native Qwen preprocessing still applies.",
+                ),
+                io.String.Input(
+                    "baseline",
+                    optional=True,
+                    force_input=True,
+                    dynamic_prompts=False,
+                    tooltip="Four literal strings in TL/TR/BR/BL execution-list order, encoded text-only for prediction blending and after end_percent. An absent or empty list uses native empty-prompt embeddings. Does not inherit prompts; connect the same list to both inputs to match their text.",
                 ),
             ],
             outputs=[io.Conditioning.Output("local_positive", is_output_list=True)],
@@ -160,7 +171,14 @@ class TileKrea2Conditioning(io.ComfyNode):
 
     @classmethod
     def execute(
-        cls, clip, reference_tiles, strength, end_percent, downsize_to_1mp, prompts=None
+        cls,
+        clip,
+        reference_tiles,
+        strength,
+        end_percent,
+        downsize_to_1mp,
+        prompts=None,
+        baseline=None,
     ):
         ordinary = {
             "clip": clip,
@@ -175,7 +193,9 @@ class TileKrea2Conditioning(io.ComfyNode):
                     f"{name} requires one execution-list item; list sweeps are unsupported"
                 )
             ordinary[name] = values[0]
-        return io.NodeOutput(encode_tiles(**ordinary, prompts=prompts))
+        return io.NodeOutput(
+            encode_tiles(**ordinary, prompts=prompts, baseline=baseline)
+        )
 
 
 class TileSampler(io.ComfyNode):
