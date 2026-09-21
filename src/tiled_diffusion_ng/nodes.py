@@ -6,6 +6,7 @@
 from comfy_api.latest import io
 
 from . import _comfy_sampling
+from ._krea2_conditioning import encode_tiles
 from .adapters import resolve_adapter
 from .adapters._anima_lllite import apply_lllite
 from .geometry import image_views, make_plan
@@ -106,6 +107,75 @@ class TileView(io.ComfyNode):
     @classmethod
     def execute(cls, image, tile_plan):
         return io.NodeOutput(image_views(image, tile_plan))
+
+
+class TileKrea2Conditioning(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TiledDiffusionNG_TileKrea2Conditioning",
+            display_name="TileKrea2Conditioning",
+            category=CATEGORY,
+            description=(
+                "Jointly encode exactly four TileView images and optional texts with native Krea2 CLIP. "
+                "Returns four complete local positives in TL/TR/BR/BL order for TileSampler. "
+                "These replace the global positive, including its reference metadata. "
+                "This node produces vision conditioning without VAE reference latents."
+            ),
+            is_input_list=True,
+            inputs=[
+                io.Clip.Input("clip"),
+                io.Image.Input("reference_tiles"),
+                io.String.Input(
+                    "prompts",
+                    optional=True,
+                    force_input=True,
+                    dynamic_prompts=False,
+                    tooltip="Four literal strings in TL/TR/BR/BL execution-list order. Empty strings omit tile text; an absent or empty list encodes images only.",
+                ),
+                io.Float.Input(
+                    "strength",
+                    default=1.0,
+                    min=0.0,
+                    max=3.0,
+                    step=0.05,
+                    tooltip="Scale the complete image/text embedding amplitude. Visual effects depend on the model; 0 zeros the embeddings, 1 preserves native output.",
+                ),
+                io.Float.Input(
+                    "end_percent",
+                    default=1.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.001,
+                    tooltip="After this diffusion percentage, use unscaled empty-prompt conditioning with no tile image or text. Native scheduling includes both entries at the exact cutoff.",
+                ),
+                io.Boolean.Input(
+                    "downsize_to_1mp",
+                    default=False,
+                    tooltip="Downsize tiles larger than 1024² pixels with antialiased bicubic, preserving aspect ratio and floating-point pixels. Native Qwen preprocessing still applies.",
+                ),
+            ],
+            outputs=[io.Conditioning.Output("local_positive", is_output_list=True)],
+        )
+
+    @classmethod
+    def execute(
+        cls, clip, reference_tiles, strength, end_percent, downsize_to_1mp, prompts=None
+    ):
+        ordinary = {
+            "clip": clip,
+            "reference_tiles": reference_tiles,
+            "strength": strength,
+            "end_percent": end_percent,
+            "downsize_to_1mp": downsize_to_1mp,
+        }
+        for name, values in ordinary.items():
+            if not isinstance(values, list) or len(values) != 1:
+                raise ValueError(
+                    f"{name} requires one execution-list item; list sweeps are unsupported"
+                )
+            ordinary[name] = values[0]
+        return io.NodeOutput(encode_tiles(**ordinary, prompts=prompts))
 
 
 class TileSampler(io.ComfyNode):

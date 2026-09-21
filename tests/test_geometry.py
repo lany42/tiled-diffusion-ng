@@ -133,9 +133,10 @@ def test_revalidate_untrusted_plans(field, value):
 
 
 @pytest.mark.parametrize("channels", [3, 4])
-def test_actual_views_are_image_major_and_preserve_values(channels):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_actual_views_are_image_major_and_preserve_values(channels, dtype):
     plan = make_plan(spec((5, 7), scale=(2, 3)), 3)
-    image = torch.arange(2 * 10 * 21 * channels, dtype=torch.float64).reshape(
+    image = torch.arange(2 * 10 * 21 * channels, dtype=dtype).reshape(
         2, 10, 21, channels
     )
     before = image.clone()

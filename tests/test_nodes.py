@@ -62,7 +62,7 @@ def test_host_imports_and_registries_are_restored_between_runs():
 
 
 @pytest.mark.parametrize("archive", [False, True])
-def test_four_node_extension_and_clone_loader(host, monkeypatch, tmp_path, archive):
+def test_extension_and_clone_loader(host, monkeypatch, tmp_path, archive):
     extension = asyncio.run(comfy_entrypoint())
     classes = asyncio.run(extension.get_node_list())
     assert [c.define_schema().node_id for c in classes] == [
@@ -70,6 +70,7 @@ def test_four_node_extension_and_clone_loader(host, monkeypatch, tmp_path, archi
         "TiledDiffusionNG_TileView",
         "TiledDiffusionNG_TileSampler",
         "TiledDiffusionNG_TiledAnimaLLLiteApply",
+        "TiledDiffusionNG_TileKrea2Conditioning",
     ]
     root = ROOT
     if archive:
@@ -87,7 +88,9 @@ def test_four_node_extension_and_clone_loader(host, monkeypatch, tmp_path, archi
     monkeypatch.setitem(sys.modules, "tdng_clone", module)
     loader.loader.exec_module(module)
     nodes = asyncio.run(asyncio.run(module.comfy_entrypoint()).get_node_list())
-    assert len(nodes) == 4
+    assert [node.define_schema().node_id for node in nodes] == [
+        node.define_schema().node_id for node in classes
+    ]
 
 
 def test_tiled_lllite_schema_and_execution(host):
