@@ -1,6 +1,6 @@
 # Tiled Diffusion NG
 
-Three ComfyUI nodes for tiled sampling, blending four overlapping views into
+Five ComfyUI nodes for tiled sampling, blending four overlapping views into
 one full-resolution latent through a single KSampler trajectory.
 
 ```bash
@@ -13,9 +13,9 @@ git clone https://git.colorized.life/tiled-diffusion-ng.git tiled-diffusion-ng
 
 | Model | Supported | ControlNets |
 | --- | :---: | :---: |
-| SDXL | ☑ | ☑ |
-| Anima | ☑ | ☑ |
-| Krea2 | ☐ | ☐ |
+| SDXL | ✅ | ✅ native Apply Controlnet |
+| Anima | ✅ | ✅ TileAnimaLLLiteApply |
+| Krea2 | ✅ | ✅ TileKrea2Conditioning |
 
 SDXL support covers base models and ordinary RGB SDXL ControlNet.
 
@@ -26,6 +26,8 @@ SDXL support covers base models and ordinary RGB SDXL ControlNet.
 | TilePlan | `TiledDiffusionNG_TilePlan` | `model`, `latent`, `tile_overlap` → TILE_PLAN |
 | TileView | `TiledDiffusionNG_TileView` | `image`, `tile_plan` → IMAGE batch |
 | TileSampler | `TiledDiffusionNG_TileSampler` | KSampler inputs, `tile_plan`, optional `local_positive` → LATENT |
+| TiledAnimaLLLiteApply | `TiledDiffusionNG_TiledAnimaLLLiteApply` | `model`, `model_patch`, `tile_plan`, `reference_tiles`, strength and schedule → MODEL |
+| TileKrea2Conditioning | `TiledDiffusionNG_TileKrea2Conditioning` | `clip`, `reference_tiles`, optional `prompts`, strength, schedule and downsizing → CONDITIONING list |
 
 ## Workflow
 
