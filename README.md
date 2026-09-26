@@ -29,7 +29,7 @@ SDXL support covers base models and ordinary RGB SDXL ControlNet.
 | TileView | `TiledDiffusionNG_TileView` | `image`, `tile_plan` → IMAGE batch |
 | TileSampler | `TiledDiffusionNG_TileSampler` | KSampler inputs, `tile_plan`, optional `local_positive` → LATENT |
 | TiledAnimaLLLiteApply | `TiledDiffusionNG_TiledAnimaLLLiteApply` | `model`, `model_patch`, `tile_plan`, `reference_tiles`, strength and schedule → MODEL |
-| TileKrea2Conditioning | `TiledDiffusionNG_TileKrea2Conditioning` | `clip`, `reference_tiles`, optional `prompts`, strength, schedule and downsizing → CONDITIONING list |
+| TileKrea2Conditioning | `TiledDiffusionNG_TileKrea2Conditioning` | `clip`, `reference_tiles`, optional `prompts` and `baseline`, strength, schedule and downsizing → CONDITIONING list |
 
 ## Workflow
 
