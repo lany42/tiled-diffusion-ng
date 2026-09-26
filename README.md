@@ -1,5 +1,7 @@
 # Tiled Diffusion NG
 
+The canonical home of this repository is at https://git.colorized.life/tiled-diffusion-ng/
+
 Five ComfyUI nodes for tiled sampling, blending four overlapping views into
 one full-resolution latent through a single KSampler trajectory.
 
