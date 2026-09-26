@@ -1,6 +1,6 @@
 [project]
 name = "tiled-diffusion-ng"
-version = "1.1.0"
+version = "1.1.1"
 description = "Four-view Mixture of Diffusers sampling for SDXL in ComfyUI."
 readme = "README.md"
 authors = [
@@ -18,6 +18,7 @@ Homepage = "https://git.colorized.life/tiled-diffusion-ng/"
 
 [tool.comfy]
 PublisherId = "lany-atwood"
+DisplayName = "Tiled Diffusion NG"
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
