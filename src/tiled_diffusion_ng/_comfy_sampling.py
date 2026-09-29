@@ -7,7 +7,7 @@ import torch
 
 from .adapters import resolve_adapter
 from .fusion import FusionWeights, working_dtype
-from .geometry import TILE_IDS, crop
+from .geometry import TILE_IDS, crop, pad_spatial
 
 TAG = "tdng_tile_id"
 WRAPPER_KEY = "tiled_diffusion_ng.v1"
@@ -151,6 +151,10 @@ class TileEvaluation:
                 self.plan, device=x_in.device, dtype=x_in.dtype, rank=x_in.ndim
             )
 
+        # Native DiTs pad for each evaluation and crop predictions afterward.
+        # Keep the host trajectory, noise, masks and global CFG at the requested
+        # size; all four aligned views share this temporary padded canvas.
+        padded_x = pad_spatial(x_in, self.plan.padded_latent_hw)
         accumulators = [None] * len(conds)
         output_dtypes = [None] * len(conds)
         weight_sets = [None] * len(conds)
@@ -168,7 +172,7 @@ class TileEvaluation:
             ]
             # All views read this same x/sigma. Call the continuation (never the
             # outer calc_cond_batch), preserving this evaluation's live options.
-            tile_x = crop(x_in, region.sampling)
+            tile_x = crop(padded_x, region.sampling)
             with self.context.tile_options(model_options, region) as options:
                 predictions = executor(model, tile_conds, tile_x, timestep, options)
             if len(predictions) != len(conds):
@@ -194,7 +198,7 @@ class TileEvaluation:
                         )
                     weights = self.weights[key]
                     accumulators[index] = torch.zeros(
-                        x_in.shape, dtype=dtype, device=x_in.device
+                        padded_x.shape, dtype=dtype, device=x_in.device
                     )
                     output_dtypes[index] = prediction.dtype
                     weight_sets[index] = weights

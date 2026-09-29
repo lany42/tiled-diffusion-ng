@@ -14,7 +14,7 @@ from .test_geometry import spec
 
 def fuse(weights, fields):
     out = torch.zeros(
-        (*fields[0].shape[:-2], *weights.plan.latent_hw), dtype=weights.dtype
+        (*fields[0].shape[:-2], *weights.plan.padded_latent_hw), dtype=weights.dtype
     )
     for region, field in zip(weights.plan.regions, fields, strict=True):
         weights.accumulate(out, field, region)

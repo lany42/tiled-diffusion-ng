@@ -60,7 +60,7 @@ class Krea2Adapter:
         # Each target view and whole reference gets native per-image positions;
         # do not introduce full-canvas offsets or crop reference latents.
         # https://github.com/Comfy-Org/ComfyUI/blob/c194dd00cd42aa18d9dbf27d977bf6b85d9ea565/comfy/ldm/krea2/model.py#L283-L403
-        return image_spec(samples, "Krea2", "krea2", 1)
+        return image_spec(samples, "krea2", 1)
 
     def validate_sampling(self, model, latent, plan):
         validate_plan(plan, self.describe(model, latent))

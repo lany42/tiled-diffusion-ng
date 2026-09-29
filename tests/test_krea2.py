@@ -156,13 +156,6 @@ def test_impossible_four_view_plans(host, hw, overlap):
         make_plan(spec, overlap)
 
 
-@pytest.mark.parametrize("hw", [(11, 12), (12, 13)])
-def test_no_implicit_target_padding(host, hw):
-    model = Model("krea2")
-    with pytest.raises(ValueError, match="divisible by 16 pixels"):
-        resolve_adapter(model).describe(model, {"samples": torch.zeros(1, 16, *hw)})
-
-
 @pytest.mark.parametrize(
     "samples",
     [
@@ -738,15 +731,17 @@ def test_live_wrappers_registrations_shift_and_weight_loras_preserved(host):
     "failure",
     [None, "prepare", "finalize", "clone", "host_prepare", "tile", "cancel", "cleanup"],
 )
+@pytest.mark.parametrize("hw", [(12, 16), (13, 15)])
 def test_context_state_released_on_every_exit_and_subsequent_reuse(
-    host, monkeypatch, failure
+    host, monkeypatch, failure, hw
 ):
     args = arguments(
+        hw=hw,
         positive=cond(
             2,
             reference_latents=[torch.ones(1, 16, 1, 5, 7)],
             reference_latents_method="index",
-        )
+        ),
     )
     adapter = resolve_adapter(args["model"])
     create, evaluation_type = adapter.create_sampling_context, sampling.TileEvaluation

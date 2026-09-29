@@ -77,12 +77,7 @@ def validate_target(model, latent, family):
     return samples
 
 
-def image_spec(samples, family, adapter_id, adapter_version):
-    if any(n % 2 for n in samples.shape[-2:]):
-        raise ValueError(
-            f"{family} canvas dimensions must be divisible by 16 pixels "
-            "(latent alignment 2); resizing and padding are unsupported"
-        )
+def image_spec(samples, adapter_id, adapter_version):
     # Both input layouts have one canonical evaluation signature. Only the
     # host introduces T=1, and its native 5D output remains unchanged.
     # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/sample.py#L45-L71
@@ -96,6 +91,7 @@ def image_spec(samples, family, adapter_id, adapter_version):
         scale=(8, 8),
         alignment=(2, 2),
         minimum=(2, 2),
+        padding="circular",
     )
     return LatentSpec(signature, tuple(samples.shape[-2:]))
 

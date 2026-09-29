@@ -70,7 +70,7 @@ class TilePlan(io.ComfyNode):
             node_id="TiledDiffusionNG_TilePlan",
             display_name="TilePlan",
             category=CATEGORY,
-            description="Four views for SDXL, native Anima (Base, Aesthetic, Turbo, 2.9B), or Krea2 (Raw, Turbo). Anima and Krea2 require 16-channel image latents and canvas dimensions divisible by 16 pixels; overlap rounds to aligned views without padding.",
+            description="Four views for SDXL, native Anima (Base, Aesthetic, Turbo, 2.9B), or Krea2 (Raw, Turbo). Anima and Krea2 require 16-channel image latents. Canvases are automatically padded on the right and bottom to 16-pixel alignment using ComfyUI's circular padding; TileSampler returns the original dimensions. Overlap rounds to aligned views.",
             inputs=[
                 io.Model.Input("model"),
                 io.Latent.Input("latent"),
@@ -99,7 +99,7 @@ class TileView(io.ComfyNode):
             node_id="TiledDiffusionNG_TileView",
             display_name="TileView",
             category=CATEGORY,
-            description="Crop the plan's overlap-inclusive sampling rectangles from an image at the exact canvas size. Returns one IMAGE batch: image 0 TL/TR/BR/BL, then image 1 TL/TR/BR/BL, and so on.",
+            description="Crop the plan's overlap-inclusive sampling rectangles from an image at the original canvas size. Applies the plan's right/bottom padding automatically. Returns one IMAGE batch: image 0 TL/TR/BR/BL, then image 1 TL/TR/BR/BL, and so on.",
             inputs=[io.Image.Input("image"), PLAN.Input("tile_plan")],
             outputs=[io.Image.Output("tiles")],
         )
@@ -213,6 +213,7 @@ class TileSampler(io.ComfyNode):
             description=(
                 "One native trajectory for SDXL, Anima, or Krea2 Raw/Turbo generation and refinement. "
                 "Anima/Krea2 accept 16-channel 4D or single-frame 5D targets, require B×1×1×H×W noise masks, and return 5D. "
+                "Unaligned canvases use native circular padding during tiled evaluation; output dimensions remain unchanged. "
                 "Krea2 keeps whole B×16×1×H×W references; choose index or index_timestep_zero with Edit Model Reference Method. "
                 "Anima/Krea2 conditioning ControlNets are unsupported; Krea2 LLLite remains TBD. "
                 "For Anima RGB refinement use TiledAnimaLLLiteApply with the same plan; native LLLite chaining is unsupported. "

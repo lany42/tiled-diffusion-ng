@@ -113,12 +113,14 @@ def test_invalid_overlap(overlap):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("schema_version", 2),
+        ("schema_version", 1),
         ("layout", "grid"),
         ("tile_count", 3),
         ("tile_ids", ("TL", "TR", "BL", "BR")),
         ("variance", 0.1),
         ("pixel_hw", (1, 1)),
+        ("padded_latent_hw", (22, 22)),
+        ("padded_pixel_hw", (176, 176)),
         ("effective_overlap", (0, 0)),
         ("tile_hw", (2, 2)),
         ("regions", ()),

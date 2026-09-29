@@ -38,7 +38,7 @@ class FusionWeights:
             (1,) * (rank - 2) + plan.tile_hw
         )
         self.denominator = torch.zeros(
-            (1,) * (rank - 2) + plan.latent_hw, device=device, dtype=self.dtype
+            (1,) * (rank - 2) + plan.padded_latent_hw, device=device, dtype=self.dtype
         )
         for region in plan.regions:
             crop(self.denominator, region.sampling).add_(self.kernel)
@@ -56,4 +56,6 @@ class FusionWeights:
         # Normalize in >=FP32 (FP64 stays FP64); singleton non-spatial axes
         # broadcast over every batch/channel. No epsilon clamp: edge weights
         # can be tiny but are positive. This preserves constant predictions.
-        return (output / self.denominator).to(dtype)
+        h, w = self.plan.latent_hw
+        # Discard padding before returning predictions to native CFG/solvers.
+        return (output[..., :h, :w] / self.denominator[..., :h, :w]).to(dtype)

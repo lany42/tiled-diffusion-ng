@@ -945,10 +945,11 @@ def test_invocation_tensors_are_released(clip, monkeypatch, failure, fail_at):
     assert references and all(reference() is None for reference in references)
 
 
-def test_tileview_to_helper_to_sampler_has_one_trajectory(clip, host):
+@pytest.mark.parametrize("hw", [(12, 16), (13, 15)])
+def test_tileview_to_helper_to_sampler_has_one_trajectory(clip, host, hw):
     from tiled_diffusion_ng.nodes import TileKrea2Conditioning, TileSampler, TileView
 
-    args = sampler_arguments(cfg=1, negative=cond(0, width=30720))
+    args = sampler_arguments(cfg=1, negative=cond(0, width=30720), hw=hw)
     args["model"].model.diffusion_model.txtdim = 2560
     args["positive"] = cond(
         999,
@@ -969,7 +970,7 @@ def test_tileview_to_helper_to_sampler_has_one_trajectory(clip, host):
         **{key: [value] for key, value in args.items()}, local_positive=local
     )
     assert len(host.common_calls) == 1
-    assert result[0]["samples"].shape == (1, 16, 1, 12, 16)
+    assert result[0]["samples"].shape == (1, 16, 1, *hw)
     assert len({conditioning[0][0].mean().item() for conditioning in local}) == 4
     for index, (embedding, meta) in enumerate(host.common_calls[0]["positive"]):
         assert embedding is local[index][0][0]

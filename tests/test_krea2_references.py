@@ -143,8 +143,9 @@ def test_turbo_zeroed_negative_preserves_native_conditioning_paths(
 
 @pytest.mark.parametrize("method", ["index", "index_timestep_zero"])
 @pytest.mark.parametrize("collection", [list, tuple])
+@pytest.mark.parametrize("hw", [(12, 16), (13, 15)])
 def test_whole_odd_references_native_containers_and_metadata_identity(
-    host, method, collection
+    host, method, collection, hw
 ):
     refs = collection([reference(2, hw=(5, 7)), reference(6, batch=3, hw=(9, 3))])
     before = [value.clone() for value in refs]
@@ -157,7 +158,7 @@ def test_whole_odd_references_native_containers_and_metadata_identity(
         pooled_output=pooled,
     )
     original_meta = source[0][1].copy()
-    args = arguments(batch=2, positive=source, cfg=1)
+    args = arguments(batch=2, positive=source, cfg=1, hw=hw)
     sampling.sample(**args)
     for embedding, meta in host.common_calls[0]["positive"]:
         assert embedding is source[0][0] and meta["reference_latents"] is refs

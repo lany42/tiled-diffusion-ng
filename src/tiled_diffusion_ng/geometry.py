@@ -6,6 +6,7 @@
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 TILE_IDS = ("TL", "TR", "BR", "BL")
 type Rect = tuple[int, int, int, int]
@@ -26,6 +27,7 @@ class GeometrySignature:
     scale: HW = (8, 8)
     alignment: HW = (1, 1)
     minimum: HW = (1, 1)
+    padding: str = "none"
 
 
 @dataclass(frozen=True)
@@ -48,7 +50,7 @@ class TileRegion:
 
 @dataclass(frozen=True)
 class TilePlanData:
-    """Immutable geometry with (H, W) pairs and requested overlap in pixels."""
+    """Requested and padded (H, W) canvases; regions use the padded canvas."""
 
     signature: GeometrySignature
     latent_hw: HW
@@ -59,7 +61,9 @@ class TilePlanData:
     tile_hw: HW
     tile_pixel_hw: HW
     regions: tuple[TileRegion, ...]
-    schema_version: int = 1
+    padded_latent_hw: HW
+    padded_pixel_hw: HW
+    schema_version: int = 2
     layout: str = "quadrants_2x2"
     tile_count: int = 4
     tile_ids: tuple[str, ...] = TILE_IDS
@@ -92,6 +96,11 @@ def make_plan(spec: LatentSpec, overlap: int) -> TilePlanData:
         _positive_pair(value, name)
     h, w = spec.canvas
     sy, sx = s.scale
+    if s.padding not in ("none", "circular"):
+        raise ValueError("Unsupported canvas padding policy")
+    if s.padding == "circular":
+        h += -h % s.alignment[0]
+        w += -w % s.alignment[1]
 
     # Our fixed-four coverage derivation: 2*t - length >= ceil(p/scale).
     # Round that lower bound and the minimum upward to the crop lattice.
@@ -115,7 +124,7 @@ def make_plan(spec: LatentSpec, overlap: int) -> TilePlanData:
     th, tw = (
         extent(n, scale, align, minimum)
         for n, scale, align, minimum in zip(
-            spec.canvas, s.scale, s.alignment, s.minimum, strict=True
+            (h, w), s.scale, s.alignment, s.minimum, strict=True
         )
     )
     samples = (
@@ -142,20 +151,22 @@ def make_plan(spec: LatentSpec, overlap: int) -> TilePlanData:
     )
     return TilePlanData(
         s,
-        (h, w),
-        (h * sy, w * sx),
+        spec.canvas,
+        (spec.canvas[0] * sy, spec.canvas[1] * sx),
         overlap,
         (2 * th - h, 2 * tw - w),
         ((2 * th - h) * sy, (2 * tw - w) * sx),
         (th, tw),
         (th * sy, tw * sx),
         regions,
+        (h, w),
+        (h * sy, w * sx),
     )
 
 
 def validate_plan(plan, spec: LatentSpec | None = None) -> TilePlanData:
-    if type(plan) is not TilePlanData or plan.schema_version != 1:
-        raise ValueError("Expected TILE_PLAN schema version 1")
+    if type(plan) is not TilePlanData or plan.schema_version != 2:
+        raise ValueError("Expected TILE_PLAN schema version 2")
     try:
         expected = make_plan(
             LatentSpec(plan.signature, plan.latent_hw), plan.requested_overlap
@@ -178,6 +189,20 @@ def crop(tensor: torch.Tensor, rect: Rect) -> torch.Tensor:
     return tensor[..., y0:y1, x0:x1]
 
 
+def pad_spatial(tensor: torch.Tensor, hw: HW) -> torch.Tensor:
+    """Match native right/bottom patch padding, without importing host APIs."""
+    if tuple(tensor.shape[-2:]) == hw:
+        return tensor
+    # ComfyUI's common_dit.pad_to_patch_size uses circular padding, falling
+    # back to reflect while tracing/scripting. Leave time and channels intact.
+    # https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/common_dit.py
+    mode = (
+        "reflect" if torch.jit.is_tracing() or torch.jit.is_scripting() else "circular"
+    )
+    padding = (0, hw[1] - tensor.shape[-1], 0, hw[0] - tensor.shape[-2])
+    return F.pad(tensor, padding + (0, 0) * (tensor.ndim - 4), mode=mode)
+
+
 def image_views(image: torch.Tensor, plan: TilePlanData) -> torch.Tensor:
     validate_plan(plan)
     if (
@@ -191,6 +216,7 @@ def image_views(image: torch.Tensor, plan: TilePlanData) -> torch.Tensor:
         raise ValueError(
             f"Expected image H×W {plan.pixel_hw}; received {tuple(image.shape[1:3])}"
         )
+    image = pad_spatial(image.movedim(-1, 1), plan.padded_pixel_hw).movedim(1, -1)
     views = []
     for region in plan.regions:
         x0, y0, x1, y1 = region.pixel_sampling

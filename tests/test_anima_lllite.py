@@ -61,14 +61,15 @@ def patched(args=None, *, groups=None, channels=3, weights=None, **settings):
 
 
 @pytest.mark.parametrize("combined", [False, True])
+@pytest.mark.parametrize("hw", [(12, 16), (13, 15)])
 @pytest.mark.parametrize(
     "batch,groups,channels,cfg,entries",
     [(1, 1, 3, 4, 1), (2, 2, 4, 4, 2), (2, 1, 3, 1, 2)],
 )
 def test_crop_routing_batches_branches_and_native_hooks(
-    host, combined, batch, groups, channels, cfg, entries
+    host, combined, hw, batch, groups, channels, cfg, entries
 ):
-    args = arguments(batch=batch, cfg=cfg, steps=1)
+    args = arguments(batch=batch, cfg=cfg, steps=1, hw=hw)
     args["positive"] = cond(2) + (cond(3, strength=0.5) if entries == 2 else [])
     host.combine_anima_conditions = combined
     host.evaluations_per_step = 1
@@ -639,8 +640,11 @@ def test_local_prompts_global_cfg_wrappers_loras_and_live_options(host, combined
 
 
 @pytest.mark.parametrize("failure", [None, "prepare", "tile", "native", "cancel"])
-def test_lifecycle_closes_handles_delegates_and_aba_reuse(host, monkeypatch, failure):
-    args, _, refs, _ = patched()
+@pytest.mark.parametrize("hw", [(12, 16), (13, 15)])
+def test_lifecycle_closes_handles_delegates_and_aba_reuse(
+    host, monkeypatch, failure, hw
+):
+    args, _, refs, _ = patched(arguments(hw=hw, steps=1))
     original_refs = refs.clone()
     attachment = get_attachment(args["model"])
     graph_hook_state = copy.copy(attachment.post_input.__dict__)

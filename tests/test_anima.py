@@ -136,15 +136,6 @@ def test_aligned_rectangles_effective_overlap_and_exact_tileview_order(host, hw)
     assert image.equal(before)
 
 
-@pytest.mark.parametrize(
-    "shape", [(1, 16, 11, 12), (1, 16, 12, 13), (1, 16, 1, 11, 12)]
-)
-def test_canvas_alignment_rejects_without_padding(host, shape):
-    model = Model("anima")
-    with pytest.raises(ValueError, match="divisible by 16 pixels"):
-        resolve_adapter(model).describe(model, {"samples": torch.zeros(shape)})
-
-
 @pytest.mark.parametrize("hw,overlap", [((2, 8), 0), ((4, 4), 1), ((12, 16), 96)])
 def test_impossible_four_view_geometry(host, hw, overlap):
     from tiled_diffusion_ng.nodes import TilePlan

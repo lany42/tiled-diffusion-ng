@@ -57,7 +57,7 @@ class AnimaAdapter:
             raise ValueError(
                 "Anima requires native tile-local RoPE without extra absolute positions"
             )
-        return image_spec(samples, "Anima", "anima", 1)
+        return image_spec(samples, "anima", 1)
 
     def validate_sampling(self, model, latent, plan):
         validate_plan(plan, self.describe(model, latent))
