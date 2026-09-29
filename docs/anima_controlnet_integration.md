@@ -50,7 +50,9 @@ deferred tiled routing; other transformer patches/replacements raise `ValueError
 Recognition is validation only, including when strength is zero. Future LLLite
 support must admit only its validated attachment/hook set through these guards.
 
-[Offline tests](../tests/test_anima.py) cover the base contracts, including
+[Offline tests](../tests/test_anima.py) and the shared
+[adapter](../tests/test_adapters.py) and [sampling](../tests/test_sampling.py)
+tests cover the base contracts, including
 28/40-layer configurations, live options and cleanup. They neither execute
 native LLLite hooks nor establish checkpoint or visual compatibility. Base,
 Aesthetic, Turbo and 2.9B each still require real-host generation/refinement,

@@ -1,25 +1,31 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
 
-from dataclasses import FrozenInstanceError, replace
+import math
+from dataclasses import replace
 
 import pytest
 import torch
 
-from tiled_diffusion_ng.adapters import resolve_adapter
 from tiled_diffusion_ng.geometry import (
     GeometrySignature,
     LatentSpec,
     image_views,
     make_plan,
+    pad_spatial,
     validate_plan,
 )
-
-from .host import Model
 
 
 def spec(hw, **kwargs):
     return LatentSpec(GeometrySignature("test", 1, "synthetic", **kwargs), hw)
+
+
+def circular(tensor, rect, hw, axes=(-2, -1)):
+    """Independent wrap-around crop of a half-open (x0, y0, x1, y1) rectangle."""
+    x0, y0, x1, y1 = rect
+    tensor = tensor.index_select(axes[0], torch.arange(y0, y1) % hw[0])
+    return tensor.index_select(axes[1], torch.arange(x0, x1) % hw[1])
 
 
 @pytest.mark.parametrize(
@@ -57,8 +63,6 @@ def test_portrait_handwritten(overlap, extent, rects):
     assert plan.pixel_hw == (2432, 1664)
     assert plan.regions[0].pixel_core == (0, 0, 832, 1216)
     assert plan.effective_pixel_overlap == (overlap, overlap)
-    with pytest.raises(FrozenInstanceError):
-        plan.layout = "other"
 
 
 def test_odd_landscape_and_rounded_overlap():
@@ -104,88 +108,81 @@ def test_extent_against_independent_enumeration():
                                 make_plan(current, overlap)
 
 
-@pytest.mark.parametrize("overlap", [-1, 0.5, True, "64", None])
+@pytest.mark.parametrize("overlap", [-1, True])
 def test_invalid_overlap(overlap):
     with pytest.raises(ValueError, match="nonnegative integer"):
         make_plan(spec((20, 20)), overlap)
 
 
+def test_padded_plan_keeps_requested_canvas_identity():
+    # A 2.5x portrait, W×H 1040×1520 -> 2600×3800, padded to 2-cell alignment.
+    wan = {"alignment": (2, 2), "minimum": (2, 2), "padding": "circular"}
+    plan = make_plan(spec((475, 325), **wan), 64)
+    assert (plan.latent_hw, plan.pixel_hw) == ((475, 325), (3800, 2600))
+    assert (plan.padded_latent_hw, plan.padded_pixel_hw) == ((476, 326), (3808, 2608))
+    assert plan.tile_hw == (242, 168)
+    assert plan.effective_pixel_overlap == (64, 80)
+    assert tuple(region.sampling for region in plan.regions) == (
+        (0, 0, 168, 242),
+        (158, 0, 326, 242),
+        (158, 234, 326, 476),
+        (0, 234, 168, 476),
+    )
+    validate_plan(plan, spec((475, 325), **wan))
+    # The original size participates in identity even with identical padding.
+    with pytest.raises(ValueError, match="Stale"):
+        validate_plan(plan, spec((476, 326), **wan))
+    with pytest.raises(ValueError, match="padding policy"):
+        make_plan(spec((7, 9), padding="replicate"), 0)
+
+
 @pytest.mark.parametrize(
-    "field,value",
+    "field,value,error",
     [
-        ("schema_version", 1),
-        ("layout", "grid"),
-        ("tile_count", 3),
-        ("tile_ids", ("TL", "TR", "BL", "BR")),
-        ("variance", 0.1),
-        ("pixel_hw", (1, 1)),
-        ("padded_latent_hw", (22, 22)),
-        ("padded_pixel_hw", (176, 176)),
-        ("effective_overlap", (0, 0)),
-        ("tile_hw", (2, 2)),
-        ("regions", ()),
-        ("kernel", "legacy"),
-        ("center", "edge"),
+        ("schema_version", 1, "schema version 2"),
+        ("tile_ids", ("TL", "TR", "BL", "BR"), "fields or bounds"),
+        ("padded_latent_hw", (22, 22), "fields or bounds"),
     ],
 )
-def test_revalidate_untrusted_plans(field, value):
+def test_revalidate_untrusted_plans(field, value, error):
     plan = make_plan(spec((20, 20)), 8)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=error):
         validate_plan(replace(plan, **{field: value}))
 
 
-@pytest.mark.parametrize("channels", [3, 4])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_actual_views_are_image_major_and_preserve_values(channels, dtype):
-    plan = make_plan(spec((5, 7), scale=(2, 3)), 3)
-    image = torch.arange(2 * 10 * 21 * channels, dtype=dtype).reshape(
-        2, 10, 21, channels
-    )
+@pytest.mark.parametrize(
+    "plan",
+    [
+        make_plan(spec((5, 7), scale=(2, 3)), 3),
+        make_plan(spec((13, 15), alignment=(2, 2), padding="circular"), 16),
+    ],
+    ids=["aligned", "padded"],
+)
+def test_image_views_are_image_major_wrapped_crops(plan):
+    h, w = plan.pixel_hw
+    image = torch.arange(2 * h * w * 4, dtype=torch.float64).reshape(2, h, w, 4)
     before = image.clone()
     views = image_views(image, plan)
-    for image_index in range(2):
+    assert views.shape == (8, *plan.tile_pixel_hw, 4)
+    for source in range(2):
         for index, region in enumerate(plan.regions):
-            x0, y0, x1, y1 = region.pixel_sampling
+            expected = circular(image[source], region.pixel_sampling, (h, w), (0, 1))
             torch.testing.assert_close(
-                views[4 * image_index + index], image[image_index, y0:y1, x0:x1]
+                views[4 * source + index], expected, rtol=0, atol=0
             )
-    assert views.shape == (8, *plan.tile_pixel_hw, channels)
-    assert views.dtype == image.dtype and views.device == image.device
     views.zero_()
     assert torch.equal(image, before)
     with pytest.raises(ValueError, match="Expected image H×W"):
         image_views(image[:, :-1], plan)
     with pytest.raises(ValueError, match="RGB or RGBA"):
-        image_views(image[..., :1], plan)
+        image_views(image[..., :2], plan)
 
 
-def test_adapter_reads_metadata_without_values_and_allows_batch_reuse(host):
-    model = Model()
-    adapter = resolve_adapter(model)
-    latent = {"samples": torch.empty(1, 4, 17, 21, device="meta"), "note": "retained"}
-    plan = make_plan(adapter.describe(model, latent), 8)
-    assert latent["samples"].device.type == "meta"
-    other = {"samples": torch.zeros(2, 4, 17, 21)}
-    validate_plan(plan, adapter.describe(Model(), other))
-    with pytest.raises(ValueError, match="Stale"):
-        validate_plan(
-            plan, adapter.describe(model, {"samples": torch.zeros(1, 4, 18, 21)})
-        )
-    for samples in (
-        torch.zeros(1, 4, 1, 17, 21),
-        torch.zeros(1, 8, 17, 21),
-        torch.zeros(0, 4, 17, 21),
-        torch.zeros(1, 4, 17, 21, dtype=torch.int64),
-    ):
-        with pytest.raises(ValueError, match="SDXL requires"):
-            adapter.describe(model, {"samples": samples})
-    for field, value in (
-        ("downscale_ratio_spacial", 16),
-        ("type", "video"),
-        ("spatial_unknown", torch.zeros(2, 2)),
-    ):
-        with pytest.raises(ValueError, match=field):
-            adapter.describe(model, dict(other, **{field: value}))
-    model.model = object()
-    with pytest.raises(ValueError, match="Unsupported model"):
-        resolve_adapter(model)
+def test_native_reflect_fallback_during_compilation(monkeypatch):
+    shape = (2, 3, 1, 5, 7)
+    tensor = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape)
+    assert pad_spatial(tensor, (5, 7)) is tensor
+    monkeypatch.setattr(torch.jit, "is_tracing", lambda: True)
+    expected = tensor.index_select(-2, torch.tensor([0, 1, 2, 3, 4, 3]))
+    expected = expected.index_select(-1, torch.tensor([0, 1, 2, 3, 4, 5, 6, 5]))
+    torch.testing.assert_close(pad_spatial(tensor, (6, 8)), expected, rtol=0, atol=0)

@@ -1,6 +1,6 @@
 [project]
 name = "tiled-diffusion-ng"
-version = "1.1.1"
+version = "1.1.2"
 description = "Four-view Mixture of Diffusers sampling for SDXL in ComfyUI."
 readme = "README.md"
 authors = [

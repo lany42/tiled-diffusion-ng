@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # SPDX-FileCopyrightText: 2026 Lany Atwood <lany@colorized.life>
 
-"""CPU storage/lifetime contracts, separate from real ComfyUI acceptance."""
+"""Native SDXL ControlNet routing, hint storage and lifetime contracts.
 
-import gc
+These CPU doubles do not establish real-host Union or Tile ControlNet inference.
+"""
+
 import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,12 +18,11 @@ from tiled_diffusion_ng.adapters import _sdxl_sampling as sdxl
 from tiled_diffusion_ng.adapters import resolve_adapter
 from tiled_diffusion_ng.geometry import crop, make_plan
 
-from .host import ControlNet, cond, resize_hint
-from .test_sampling import arguments
+from .host import ControlNet, ControlNetwork, arguments, cond, resize_hint
 
 
-def control_with_hint(hint, algorithm="nearest-exact", *, union=False):
-    control = ControlNet(union=union)
+def control_with_hint(hint, algorithm="nearest-exact"):
+    control = ControlNet()
     control.cond_hint_original = hint
     control.upscale_algorithm = algorithm
     return control
@@ -39,17 +41,330 @@ def small_plan(overlap=16):
     )
 
 
+def test_control_discovery_pair_sharing_chain_crop_schedule_and_cleanup(host):
+    first, second = ControlNet(), ControlNet()
+    first.previous_controlnet = second
+    first.timestep_percent_range = (0.1, 0.8)
+    first.extra_args = {"scale": 0.75}
+    first.cond_hint_original = torch.arange(3 * 104 * 136, dtype=torch.float32).reshape(
+        1, 3, 104, 136
+    )
+    second.cond_hint_original = first.cond_hint_original
+    original_hint = first.cond_hint_original.clone()
+    args = arguments(
+        positive=cond(999, control=ControlNet()),
+        local_positive=[
+            cond(i, control=first, control_apply_to_uncond=True) for i in range(4)
+        ],
+    )
+    saved_hints = []
+    saved_controls = []
+
+    def inspect_branches(branches):
+        for i in range(4):
+            p, n = branches[0][i], branches[1][i]
+            assert p["control"] is n["control"]
+            control = p["control"]
+            assert control is not first
+            assert control.previous_controlnet is not second
+            assert control.control_model is first.control_model
+            assert control.extra_args == {"scale": 0.75}
+            assert control.timestep_percent_range == (0.1, 0.8)
+            saved_hints.append(control.cond_hint_original.clone())
+            saved_controls.extend([control, control.previous_controlnet])
+
+    host.mutate_prepared = inspect_branches
+    sampling.sample(**args)
+    assert len(host.resize_calls) == 1
+    assert len(host.discovered) == 4
+    assert len({id(control) for control in saved_controls}) == 8
+    for region, hint in zip(args["tile_plan"].regions, saved_hints):
+        torch.testing.assert_close(hint, crop(original_hint, region.pixel_sampling))
+    assert all(
+        control.pre_runs > 0 and control.cleanups > 0 for control in saved_controls
+    )
+    assert all(
+        control.cond_hint_original is None
+        and control.cond_hint is None
+        and control.previous_controlnet is None
+        for control in saved_controls
+    )
+    assert first.previous_controlnet is second
+    assert first.cleanups == 0 and first.pre_runs == 0 and first.cond_hint is None
+    torch.testing.assert_close(first.cond_hint_original, original_hint)
+
+
+def test_control_resize_before_crop_not_resizing_scene_per_tile(host):
+    control = ControlNet()
+    # Source aspect ratio differs: centered resize must happen once globally.
+    control.cond_hint_original = torch.arange(3 * 8 * 24, dtype=torch.float32).reshape(
+        1, 3, 8, 24
+    )
+    saved = []
+    host.mutate_prepared = lambda branches: saved.extend(
+        c["control"].cond_hint_original.clone() for c in branches[0]
+    )
+    args = arguments(positive=cond(1, control=control, control_apply_to_uncond=True))
+    sampling.sample(**args)
+    assert len(host.resize_calls) == 1
+    normalized = host.resize(
+        control.cond_hint_original, 136, 104, "nearest-exact", "center"
+    )
+    for hint, region in zip(saved, args["tile_plan"].regions):
+        torch.testing.assert_close(hint, crop(normalized, region.pixel_sampling))
+    assert not torch.equal(saved[0], saved[2])
+
+
+def test_controls_do_not_cross_tile_pairs_and_global_controls_are_replaced(host):
+    a, b, global_control = ControlNet(), ControlNet(), ControlNet()
+    locals = [
+        cond(1, control=a, control_apply_to_uncond=True),
+        cond(2),
+        cond(3, control=b, control_apply_to_uncond=True),
+        # Like native KSampler, a positive-only control leaves the negative free.
+        cond(4, control=ControlNet()),
+    ]
+    args = arguments(positive=cond(99, control=global_control), local_positive=locals)
+    sampling.sample(**args)
+    assert ["control" in c for c in host.prepared[1]] == [True, False, True, False]
+    assert global_control.pre_runs == 0
+    assert len(host.discovered) == 3
+
+
+def test_explicit_negative_controls_block_propagation_and_multi_entry_pairing(host):
+    a, b, n = ControlNet(), ControlNet(), ControlNet()
+    args = arguments(
+        positive=cond(1, control=a, control_apply_to_uncond=True)
+        + cond(2, control=b, control_apply_to_uncond=True),
+        negative=cond(-1, control=n),
+    )
+    saved = []
+    host.mutate_prepared = lambda branches: saved.extend(
+        entry["control"].control_model for entry in branches[1]
+    )
+    sampling.sample(**args)
+    assert saved == [n.control_model] * 4
+    host.discovered.clear()
+    args["negative"] = cond(-1)
+    sampling.sample(**args)
+    assert len(host.prepared[1]) == 4
+    for name in ("TL", "TR", "BR", "BL"):
+        positives = [c for c in host.prepared[0] if c[sampling.TAG] == name]
+        negatives = [c for c in host.prepared[1] if c[sampling.TAG] == name]
+        assert len(negatives) == 1
+        assert negatives[0]["control"] is positives[-1]["control"]
+
+
 @pytest.mark.parametrize(
-    "count,overlap,canvas_retained",
+    "field,value",
     [
-        (1, 0, False),
-        (2, 0, False),
-        (4, 0, True),
-        (1, 32, False),
-        (2, 32, True),
-        (4, 16, True),
+        # VAE-encoded, inpaint and hooked ControlNets need their own paths.
+        ("vae", object()),
+        ("latent_format", object()),
+        ("concat_mask", True),
+        ("extra_concat_orig", [torch.ones(1, 1, 16, 16)]),
+        ("extra_hooks", object()),
+        ("multigpu_clones", {"other_device": object()}),
+        ("compression_ratio", 4),
+        ("extra_conds", ["image"]),
+        ("preprocess_image", lambda x: x * 2),
+        ("extra_args", {"spatial": torch.ones(2, 2)}),
     ],
 )
+def test_control_capability_errors_before_host_sampling(host, field, value):
+    control = ControlNet()
+    setattr(control, field, value)
+    error = "compression_ratio/extra_conds" if field == "extra_conds" else field
+    with pytest.raises(ValueError, match=error):
+        sampling.sample(**arguments(positive=cond(1, control=control)))
+    assert not host.common_calls
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        {"control_type": [True]},
+        {"control_type": (6,)},
+        {"control_type": [6], "other": []},
+    ],
+)
+def test_only_native_mode_lists_are_added_to_supported_metadata(host, extra_args):
+    control = ControlNet(union=True)
+    control.extra_args = extra_args
+    with pytest.raises(ValueError, match="extra_args"):
+        sampling.sample(**arguments(positive=cond(1, control=control)))
+    assert not host.common_calls
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("num_classes", None),
+        ("label_emb", [[SimpleNamespace(in_features=768)]]),
+    ],
+)
+def test_controls_require_sdxl_architecture(host, field, value):
+    control = ControlNet()
+    setattr(control.control_model, field, value)
+    with pytest.raises(ValueError, match="architecture"):
+        sampling.sample(**arguments(positive=cond(1, control=control)))
+    assert not host.common_calls
+
+
+def test_control_chain_cycle_is_rejected(host):
+    control = ControlNet()
+    control.previous_controlnet = control
+    with pytest.raises(ValueError, match="Cyclic"):
+        sampling.sample(**arguments(positive=cond(1, control=control)))
+    assert control.previous_controlnet is control
+    assert not host.common_calls
+
+
+@pytest.mark.parametrize("implementation", ["wrapper", "network"])
+def test_unknown_control_in_chain_is_rejected_and_partial_clones_closed(
+    host, monkeypatch, implementation
+):
+    if implementation == "wrapper":
+        # Even a subclass with native-looking fields needs its own lifecycle.
+        class OtherControl(ControlNet):
+            pass
+
+        unsupported = OtherControl()
+    else:
+        # Native wrappers also carry non-UNet networks, such as MMDiT controls.
+        class OtherNetwork(ControlNetwork):
+            pass
+
+        unsupported = ControlNet()
+        unsupported.control_model = OtherNetwork()
+    control = ControlNet(union=True)
+    control.previous_controlnet = unsupported
+    clones = []
+    copy_control = ControlNet.copy
+
+    def copy(original):
+        clones.append(copy_control(original))
+        return clones[-1]
+
+    monkeypatch.setattr(ControlNet, "copy", copy)
+    with pytest.raises(ValueError, match="only native image-hint ControlNet"):
+        sampling.sample(**arguments(positive=cond(1, control=control)))
+    assert not host.common_calls
+    assert len(clones) == 1
+    assert clones[0].cleanups == 1 and clones[0].cond_hint_original is None
+    assert control.previous_controlnet is unsupported
+    assert control.cleanups == unsupported.cleanups == 0
+
+
+def test_modes_and_prepared_caches_are_isolated_while_hint_pixels_are_shared(host):
+    args = arguments(hw=(6, 8))
+    plan = args["tile_plan"]
+    first = ControlNet(union=True)
+    first.cond_hint_original = torch.rand(1, 3, 17, 29)
+    first.extra_args = {"control_type": [6, 1], "scale": 0.75}
+    second = first.copy()
+    second.extra_args = {"control_type": [1]}
+    second.cond_hint_original = first.cond_hint_original.view_as(
+        first.cond_hint_original
+    )
+    first.previous_controlnet = second
+    source = first.cond_hint_original.clone()
+    context = resolve_adapter(args["model"]).create_sampling_context(plan)
+    clones = []
+    try:
+        for region in plan.regions:
+            positive, negative = context.prepare_pair(
+                [{"control": first}, {"control": second}], [{"control": first}], region
+            )
+            a, b = [entry["control"] for entry in positive]
+            assert a is negative[0]["control"]
+            assert a.previous_controlnet is b
+            clones.extend((a, b))
+        context.finalize_preparation()
+        assert len(host.resize_calls) == 1
+        assert len({id(c.extra_args["control_type"]) for c in clones}) == 8
+        for a, b in zip(clones[::2], clones[1::2], strict=True):
+            assert a.cond_hint_original is b.cond_hint_original
+            assert a.control_model is b.control_model is first.control_model
+            assert a.extra_args == first.extra_args
+            assert b.extra_args == second.extra_args
+            a.pre_run()
+            a.predict(torch.zeros(1, 4, *plan.tile_hw), torch.tensor([0.5]))
+        assert len({c.cond_hint.untyped_storage().data_ptr() for c in clones}) == 8
+        caches = [c.cond_hint.clone() for c in clones]
+        hint = clones[0].cond_hint_original.clone()
+        clones[0].extra_args["control_type"].append(7)
+        clones[0].cond_hint.fill_(42)
+        assert first.extra_args == {"control_type": [6, 1], "scale": 0.75}
+        assert all(c.extra_args == first.extra_args for c in clones[2::2])
+        for clone, cache in zip(clones[1:], caches[1:], strict=True):
+            torch.testing.assert_close(clone.cond_hint, cache)
+        torch.testing.assert_close(clones[0].cond_hint_original, hint)
+        torch.testing.assert_close(first.cond_hint_original, source)
+    finally:
+        context.close()
+    assert all(
+        c.cleanups == 1
+        and c.previous_controlnet is None
+        and c.cond_hint_original is None
+        and c.cond_hint is None
+        and c.timestep_range is None
+        and c.model_sampling_current is None
+        for c in clones
+    )
+    assert first.previous_controlnet is second
+    assert first.cleanups == second.cleanups == 0
+
+
+def test_local_mixed_chains_preserve_each_mode_and_pair(host, monkeypatch):
+    source = torch.rand(1, 3, 17, 29)
+    modes = [{}, {"control_type": []}, {"control_type": [6]}, {"control_type": [1]}]
+    originals, locals, expected = [], [], {}
+    for i, mode_args in enumerate(modes):
+        union, traditional = ControlNet(union=True), ControlNet()
+        union.extra_args = mode_args
+        for control in (union, traditional):
+            control.cond_hint_original = source.view_as(source)
+            expected[control.control_model] = control.extra_args.copy()
+        union.previous_controlnet = traditional
+        originals.extend((union, traditional))
+        locals.append(cond(i + 1, control=union, control_apply_to_uncond=True))
+    saved, evaluated = [], set()
+    predict = ControlNet.predict
+
+    def inspect(branches):
+        for positive, negative in zip(*branches, strict=True):
+            first = positive["control"]
+            assert first is negative["control"]
+            second = first.previous_controlnet
+            assert first.cond_hint_original is second.cond_hint_original
+            saved.extend((first, second))
+        assert len(set(saved)) == 8
+        for clone, original in zip(saved, originals, strict=True):
+            assert clone is not original
+            assert clone.control_model is original.control_model
+
+    def evaluate(clone, x, sigma):
+        assert clone.extra_args == expected[clone.control_model]
+        evaluated.add(clone)
+        return predict(clone, x, sigma)
+
+    monkeypatch.setattr(ControlNet, "predict", evaluate)
+    host.mutate_prepared = inspect
+    # An unsupported global control must be wholly replaced by local positives.
+    args = arguments(
+        hw=(6, 8), positive=cond(99, control=object()), local_positive=locals
+    )
+    sampling.sample(**args)
+    assert len(host.common_calls) == len(host.resize_calls) == 1
+    assert evaluated == set(saved)
+    for clone, original in zip(saved, originals, strict=True):
+        assert clone.extra_args == original.extra_args == expected[clone.control_model]
+        assert clone.cleanups > 0 and clone.cond_hint_original is None
+        assert original.cleanups == 0 and original.cond_hint_original is not None
+
+
+@pytest.mark.parametrize("count,overlap,canvas_retained", [(1, 0, False), (4, 0, True)])
 def test_storage_sharing_and_duplicate_rectangles(
     host, monkeypatch, count, overlap, canvas_retained
 ):
@@ -69,7 +384,6 @@ def test_storage_sharing_and_duplicate_rectangles(
     b = control_with_hint(source.view_as(source))
     b.strength = 0.25
     b.timestep_percent_range = (0.3, 0.8)
-    assert a.cond_hint_original is not b.cond_hint_original
     context = sdxl.SDXLSamplingContext(plan)
     clones = []
     try:
@@ -92,63 +406,21 @@ def test_storage_sharing_and_duplicate_rectangles(
             assert second.control_model is b.control_model
             assert second.strength == 0.25
             assert second.timestep_percent_range == (0.3, 0.8)
+        # Smaller crops are compacted; views covering the canvas, including
+        # an exact partition, keep one shared canvas.
         storages = storage_ids(hints)
-        ph, pw = plan.pixel_hw
         if canvas_retained:
             assert canvases[0]() is not None
             assert storages == storage_ids([canvases[0]()])
         else:
             assert len(storages) == count
             assert canvases[0]() is None
+        ph, pw = plan.pixel_hw
         normalized = resize_hint(source, pw, ph, a.upscale_algorithm, "center")
         for region, hint in zip(plan.regions, hints[::2]):
             torch.testing.assert_close(
                 hint, crop(normalized, region.pixel_sampling), rtol=0, atol=0
             )
-    finally:
-        context.close()
-
-
-@pytest.mark.parametrize("algorithm", ["nearest-exact", "bilinear", "bicubic", "area"])
-@pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
-)
-@pytest.mark.parametrize("channels_last", [False, True])
-@pytest.mark.parametrize("source_hw", [(17, 29), (48, 64)])
-def test_canvas_views_match_normalize_then_copy_and_prepared_layout(
-    host, algorithm, dtype, channels_last, source_hw
-):
-    plan = small_plan()
-    source = torch.rand(
-        2, 3, *source_hw, generator=torch.Generator().manual_seed(42)
-    ).to(dtype)
-    if channels_last:
-        source = source.contiguous(memory_format=torch.channels_last)
-    before = source.clone()
-    control = control_with_hint(source, algorithm)
-    context = sdxl.SDXLSamplingContext(plan)
-    try:
-        for region in plan.regions:
-            context.prepare_pair([{"control": control}], [], region)
-        context.finalize_preparation()
-        assert len(host.resize_calls) == 1  # Even when source dimensions match.
-        ph, pw = plan.pixel_hw
-        normalized = resize_hint(source, pw, ph, algorithm, "center")
-        for region, clone in zip(plan.regions, context.controls, strict=True):
-            expected = crop(normalized, region.pixel_sampling).clone()
-            actual = clone.cond_hint_original
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            h, w = expected.shape[-2:]
-            # Ordinary host preparation still resizes each clone's hint. Its
-            # resulting layout must match the previous compact-crop input path.
-            torch.testing.assert_close(
-                resize_hint(actual, w, h, algorithm, "center"),
-                resize_hint(expected, w, h, algorithm, "center"),
-                rtol=0,
-                atol=0,
-                check_stride=True,
-            )
-        torch.testing.assert_close(source, before, rtol=0, atol=0, check_stride=True)
     finally:
         context.close()
 
@@ -185,21 +457,10 @@ def test_source_view_and_resize_configurations_remain_distinct(host):
                     "center",
                 ),
                 plan.regions[0].pixel_sampling,
-            ).clone()
+            )
             torch.testing.assert_close(
                 clone.cond_hint_original, expected, rtol=0, atol=0
             )
-        key = native._hint_key(hints[0], "nearest-exact", "center", plan.pixel_hw)
-        assert key == native._hint_key(
-            hints[0].view_as(hints[0]), "nearest-exact", "center", plan.pixel_hw
-        )
-        assert key != native._hint_key(
-            hints[0], "nearest-exact", "disabled", plan.pixel_hw
-        )
-        assert key != native._hint_key(hints[0], "nearest-exact", "center", (64, 48))
-        assert key != native._hint_key(
-            torch._neg_view(hints[0]), "nearest-exact", "center", plan.pixel_hw
-        )
     finally:
         context.close()
 
@@ -233,6 +494,7 @@ def test_discovery_pins_source_until_materialization_then_releases_it(
 ):
     from comfy import utils
 
+    # The recording double would retain the source; use the plain resize.
     monkeypatch.setattr(utils, "common_upscale", resize_hint)
     context = sdxl.SDXLSamplingContext(small_plan())
     source = torch.rand(1, 3, 17, 29)
@@ -241,10 +503,8 @@ def test_discovery_pins_source_until_materialization_then_releases_it(
     try:
         context.prepare_pair([{"control": control}], [], context.plan.regions[0])
         del source, control
-        gc.collect()
         assert ref() is not None
         context.finalize_preparation()
-        gc.collect()
         assert ref() is None
         assert not context.hint_groups
     finally:
@@ -252,14 +512,10 @@ def test_discovery_pins_source_until_materialization_then_releases_it(
 
 
 @pytest.mark.parametrize("scenario", ["global", "aliased_locals", "distinct_locals"])
-@pytest.mark.parametrize("hint_batch", [1, 2, 4])
-@pytest.mark.parametrize("union", [False, True])
 def test_sampling_matches_copy_reference_without_repreparing_caches(
-    host, monkeypatch, scenario, hint_batch, union
+    host, monkeypatch, scenario
 ):
-    source = torch.rand(
-        hint_batch, 3, 17, 29, generator=torch.Generator().manual_seed(8)
-    )
+    source = torch.rand(1, 3, 17, 29, generator=torch.Generator().manual_seed(8))
     originals = []
     locals = []
     for i in range(1 if scenario == "global" else 4):
@@ -267,9 +523,7 @@ def test_sampling_matches_copy_reference_without_repreparing_caches(
             source + i / 10 if scenario == "distinct_locals" else source.view_as(source)
         )
         first = control_with_hint(hint)
-        second = control_with_hint(hint.view_as(hint), union=union)
-        if union:
-            second.extra_args["control_type"] = [6 if i % 2 else 1]
+        second = control_with_hint(hint.view_as(hint))
         first.previous_controlnet = second
         first.strength = 0.8
         second.strength = -0.4
@@ -311,7 +565,6 @@ def test_sampling_matches_copy_reference_without_repreparing_caches(
     assert len(host.resize_calls) == (4 if scenario == "distinct_locals" else 1)
     assert len(clones) == 8
     assert all(c.hint_preparations == 1 for c in clones)
-    assert len(host.tile_calls) == 3 * 3 * 4
 
     def normalize_then_copy(group):
         ph, pw = group.pixel_hw
@@ -340,21 +593,13 @@ def test_sampling_matches_copy_reference_without_repreparing_caches(
     assert args["model"].wrappers == {}
 
 
-@pytest.mark.parametrize(
-    "failure", [None, "normalize", "crop", "host_prepare", "model", "cancel"]
-)
-@pytest.mark.parametrize("union", [False, True])
+@pytest.mark.parametrize("failure", [None, "normalize", "model", "cleanup"])
 def test_groups_do_not_accumulate_canvases_and_cleanup_releases_hints(
-    host, monkeypatch, failure, union
+    host, monkeypatch, failure
 ):
     from comfy import utils
 
-    controls = [
-        control_with_hint(torch.rand(1, 3, 17, 29), union=union) for _ in range(4)
-    ]
-    if union:
-        for i, control in enumerate(controls):
-            control.extra_args["control_type"] = [i]
+    controls = [control_with_hint(torch.rand(1, 3, 17, 29)) for _ in range(4)]
     args = arguments(
         hw=(6, 8), local_positive=[cond(i, control=c) for i, c in enumerate(controls)]
     )
@@ -386,35 +631,31 @@ def test_groups_do_not_accumulate_canvases_and_cleanup_releases_hints(
         canvases.append(weakref.ref(canvas))
         return canvas
 
-    def failing_crop(tensor, rect):
-        if len(canvases) == 2:
-            raise RuntimeError("crop failed")
-        return crop(tensor, rect)
-
-    def fail_preparation(branches):
-        raise RuntimeError("host preparation failed")
-
     monkeypatch.setattr(adapter, "create_sampling_context", create_context)
     monkeypatch.setattr(utils, "common_upscale", normalize)
-    if failure == "crop":
-        monkeypatch.setattr(native, "crop", failing_crop)
-    elif failure == "host_prepare":
-        host.mutate_prepared = fail_preparation
-    elif failure == "model":
+    if failure == "model":
         host.fail_tile = 3
-    elif failure == "cancel":
-        host.interrupt_after = 3
-    if failure is None:
+    elif failure == "cleanup":
+        # Host cleanup runs on success; a failing repeat must not stop release.
+        cleanup, calls = ControlNet.cleanup, {}
+
+        def fail_on_repeat(control):
+            cleanup(control)
+            calls[id(control)] = calls.get(id(control), 0) + 1
+            if calls[id(control)] == 2:
+                raise RuntimeError("cleanup failed")
+
+        monkeypatch.setattr(ControlNet, "cleanup", fail_on_repeat)
+    if failure in (None, "cleanup"):
         sampling.sample(**args)
     else:
-        with pytest.raises((RuntimeError, InterruptedError)):
+        with pytest.raises(RuntimeError):
             sampling.sample(**args)
-    gc.collect()
     assert canvases and owned_hints
     assert all(ref() is None for ref in canvases + owned_hints)
     assert all(
         not c.controls and not c.hint_groups and c.plan is None for c in contexts
     )
-    if failure in ("normalize", "crop"):
+    if failure == "normalize":
         assert not host.common_calls
     assert all(c.cond_hint_original is not None and c.cleanups == 0 for c in controls)

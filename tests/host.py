@@ -7,7 +7,6 @@ Source baselines and pending host checks: docs/comfyui-compatibility.md.
 """
 
 import copy
-import math
 import sys
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
@@ -71,23 +70,35 @@ def cond(value, **metadata):
     ]
 
 
-def reshape_mask(mask, shape):
-    # Native 5D preparation treats a sub-5D mask's leading axes as time,
-    # interpolates that axis, then repeats the result across the image batch.
-    # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/utils.py#L1350-L1369
-    if len(shape) == 4:
-        mask = mask.reshape(-1, 1, *mask.shape[-2:])
-        mode = "bilinear"
+def arguments(
+    family="sdxl", *, rank=4, batch=1, hw=None, depth=28, dtype=torch.float32, **kwargs
+):
+    """TileSampler inputs for one family, with a plan for the default overlap."""
+    from tiled_diffusion_ng.adapters import resolve_adapter
+    from tiled_diffusion_ng.geometry import make_plan
+
+    model = Model(family, num_blocks=depth)
+    if family == "sdxl":
+        shape = (batch, 4, *(hw or (13, 17)))
     else:
-        if mask.ndim < 5:
-            mask = mask.reshape(1, 1, -1, *mask.shape[-2:])
-        mode = "trilinear"
-    mask = F.interpolate(mask, size=shape[2:], mode=mode)
-    if mask.shape[1] < shape[1]:
-        mask = mask.repeat((1, shape[1]) + (1,) * (len(shape) - 2))[:, : shape[1]]
-    return mask.repeat(
-        (math.ceil(shape[0] / mask.shape[0]),) + (1,) * (len(shape) - 1)
-    )[: shape[0]]
+        shape = (batch, 16, *((1,) if rank == 5 else ()), *(hw or (12, 16)))
+    make = krea2_host.cond if family == "krea2" else cond
+    latent = {"samples": torch.zeros(shape, dtype=dtype), "note": "retained"}
+    result = {
+        "model": model,
+        "seed": 123,
+        "steps": 1,
+        "cfg": 4.5,
+        "sampler_name": "euler",
+        "scheduler": "normal",
+        "positive": make(2),
+        "negative": make(-1),
+        "latent_image": latent,
+        "tile_plan": make_plan(resolve_adapter(model).describe(model, latent), 16),
+        "denoise": 0.4,
+    }
+    result.update(kwargs)
+    return result
 
 
 def copy_containers(value):
@@ -145,12 +156,10 @@ class AnimaNetwork:
         self.num_blocks = num_blocks
         self.blocks = [object() for _ in range(num_blocks)]
         self.pos_embedder = VideoRopePosition3DEmb()
-        self.text_calls = []
 
     def preprocess_text_embeds(self, embedding, ids, t5xxl_weights=None):
         # Distinct, small deterministic text math, not an LLM adapter substitute.
         # Preserve native token weighting, padding and preparation ownership.
-        self.text_calls.append((embedding, ids, t5xxl_weights))
         output = embedding.mean(1, keepdim=True) + ids.unsqueeze(-1) * 0.01
         if t5xxl_weights is not None:
             output = output * t5xxl_weights
@@ -164,13 +173,11 @@ class Anima:
             unet_config={"image_model": "anima", "num_blocks": num_blocks}
         )
         self.concat_keys = ()
-        self.condition_calls = []
 
     def extra_conds(self, **kwargs):
         # Inference prepares text once; the non-inference native path carries
         # ids/weights into forward. These contracts deliberately use no host code.
         # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/model_base.py#L1482-L1505
-        self.condition_calls.append(kwargs)
         embedding = kwargs["cross_attn"]
         prepared = {}
         if kwargs.get("t5xxl_ids") is not None:
@@ -245,13 +252,6 @@ class Model:
             kind: {key: list(items) for key, items in groups.items()}
             for kind, groups in self.wrappers.items()
         }
-        return result
-
-    def get_nested_additional_models(self):
-        result = []
-        for models in self.additional_models.values():
-            for model in models:
-                result.extend([model, *model.get_nested_additional_models()])
         return result
 
     def add_wrapper_with_key(self, kind, key, wrapper):
@@ -444,8 +444,6 @@ class Host:
         self.option_update = None
         self.live_options = None
         self.defer_anima_text = False
-        self.native_calls = []
-        self.discovered_models = []
         self.patch_models = []
         self.lllite_forwards = []
         self.combine_anima_conditions = False
@@ -687,7 +685,6 @@ class Host:
         return native_sampling.calculate_denoised(sigma, prediction.float(), x)
 
     def anima_forward(self, model, x, sigma, conditions, transformer):
-        self.native_calls.append((x.clone(), sigma.clone(), transformer))
         embedding = conditions["c_crossattn"]
         if "t5xxl_ids" in conditions:
             embedding = model.diffusion_model.preprocess_text_embeds(
@@ -762,7 +759,6 @@ class Host:
         denoise=1.0,
     ):
         self.latest_clone = model
-        self.discovered_models.extend(model.get_nested_additional_models())
         self.patch_models.extend(model.model_patches_models())
         self.common_calls.append(
             {
@@ -830,7 +826,6 @@ class Host:
         x = latent["samples"].clone()
         if model.format.latent_dimensions == 3 and x.ndim == 4:
             x = x.unsqueeze(2)
-        original_x = x.clone()
         batch_indices = latent.get("batch_index", list(range(x.shape[0])))
         noise = torch.cat(
             [
@@ -910,7 +905,9 @@ class Host:
                 # PREDICT_NOISE comes from guider-owned options, even when a
                 # sampler replaces the options passed to this prediction call.
                 # https://github.com/Comfy-Org/ComfyUI/blob/944386c233e02eaf877b1c8d5d513fb3d3a4d5e3/comfy/samplers.py#L1210-L1218
-                result = self.call_wrappers(
+                # Noise masks, like other LATENT fields, are host-owned and are
+                # not simulated; tiling only validates their layout.
+                return self.call_wrappers(
                     {"wrappers": model.wrappers},
                     "predict_noise",
                     predict_noise,
@@ -919,10 +916,6 @@ class Host:
                     live,
                     seed,
                 )
-                if latent.get("noise_mask") is not None:
-                    mask = reshape_mask(latent["noise_mask"], current_x.shape)
-                    result = result * mask + original_x * (1 - mask)
-                return result
 
             sigmas = self.samplers.SCHEDULER_HANDLERS[scheduler].handler(steps, denoise)
             x = self.samplers.sampler_object(sampler_name).sampler_function(

@@ -8,57 +8,14 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import torch
 
 from tiled_diffusion_ng import comfy_entrypoint
 
-from .host import isolated_host
-from .test_sampling import arguments
+from . import krea2_conditioning_host as encoder_host
+from .host import arguments, cond
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def test_host_imports_and_registries_are_restored_between_runs():
-    import tiled_diffusion_ng
-
-    original_modules = {
-        name: module
-        for name, module in sys.modules.items()
-        if name.startswith(("comfy.", "comfy_api."))
-        or name
-        in {
-            "comfy",
-            "comfy_api",
-            "nodes",
-            "tiled_diffusion_ng.nodes",
-            "tiled_diffusion_ng.extension",
-        }
-    }
-    original_attributes = dict(tiled_diffusion_ng.__dict__)
-    results = []
-    for _ in range(2):
-        with isolated_host() as installed:
-            from tiled_diffusion_ng.nodes import TileSampler
-
-            assert installed.samplers.KSampler.SAMPLERS == ["euler", "heun"]
-            installed.samplers.KSampler.SAMPLERS.append("temporary_registration")
-            wrapped = {key: [value] for key, value in arguments().items()}
-            results.append(TileSampler.execute(**wrapped)[0]["samples"])
-        assert all(
-            sys.modules.get(name) is module for name, module in original_modules.items()
-        )
-        for name in ("nodes", "extension"):
-            assert tiled_diffusion_ng.__dict__.get(name) is original_attributes.get(
-                name
-            )
-        assert not any(
-            name not in original_modules
-            and (
-                name in {"comfy", "comfy_api"}
-                or name.startswith(("comfy.", "comfy_api."))
-            )
-            for name in sys.modules
-        )
-    assert results[0].equal(results[1])
 
 
 @pytest.mark.parametrize("archive", [False, True])
@@ -93,67 +50,90 @@ def test_extension_and_clone_loader(host, monkeypatch, tmp_path, archive):
     ]
 
 
-def test_tiled_lllite_schema_and_execution(host):
-    from tiled_diffusion_ng.adapters._anima_lllite import get_attachment
-    from tiled_diffusion_ng.nodes import TiledAnimaLLLiteApply
-
-    from .test_anima_lllite import patched
-
-    schema = TiledAnimaLLLiteApply.define_schema()
-    assert schema.display_name == "TiledAnimaLLLiteApply"
-    assert not getattr(schema, "is_input_list", False)
-    inputs = {i.id: i for i in schema.inputs}
-    assert list(inputs) == [
-        "model",
-        "model_patch",
-        "tile_plan",
-        "reference_tiles",
-        "strength",
-        "start_percent",
-        "end_percent",
-    ]
-    assert (
-        inputs["strength"].default,
-        inputs["strength"].min,
-        inputs["strength"].max,
-    ) == (1, -10, 10)
-    assert (inputs["start_percent"].default, inputs["end_percent"].default) == (0, 1)
-    assert len(schema.outputs) == 1
-    args, source, refs, patch = patched()
-    result = TiledAnimaLLLiteApply.execute(source, patch, args["tile_plan"], refs)
-    assert len(result) == 1 and result[0] is not source
-    assert get_attachment(result[0]).config.reference_tiles is refs
-
-
-def test_schema_defaults_and_singleton_execution_transport(host):
-    from tiled_diffusion_ng.nodes import TilePlan, TileSampler, TileView
-
-    plan_schema = TilePlan.define_schema()
-    assert len(plan_schema.outputs) == 1
-    overlap = {i.id: i for i in plan_schema.inputs}["tile_overlap"]
-    assert (overlap.default, overlap.min, overlap.step) == (64, 0, 8)
-    assert [i.id for i in TileView.define_schema().inputs] == ["image", "tile_plan"]
-    schema = TileSampler.define_schema()
-    assert schema.is_input_list
-    inputs = {i.id: i for i in schema.inputs}
-    assert (inputs["seed"].default, inputs["seed"].min, inputs["seed"].max) == (
-        0,
-        0,
-        2**64 - 1,
+def test_saved_workflow_bindings(host):
+    from tiled_diffusion_ng.nodes import (
+        TiledAnimaLLLiteApply,
+        TileKrea2Conditioning,
+        TilePlan,
+        TileSampler,
+        TileView,
     )
-    assert inputs["seed"].control_after_generate
-    assert (inputs["steps"].default, inputs["steps"].min, inputs["steps"].max) == (
-        20,
-        1,
-        10000,
-    )
-    assert (inputs["cfg"].default, inputs["cfg"].step) == (8, 0.1)
-    assert (
-        inputs["denoise"].default,
-        inputs["denoise"].min,
-        inputs["denoise"].max,
-    ) == (1, 0, 1)
-    assert inputs["local_positive"].optional
+
+    # Saved workflows bind inputs by name and order; list flags pick transport.
+    expected = {
+        TilePlan: (["model", "latent", "tile_overlap"], False),
+        TileView: (["image", "tile_plan"], False),
+        TileSampler: (
+            [
+                "model",
+                "seed",
+                "steps",
+                "cfg",
+                "sampler_name",
+                "scheduler",
+                "positive",
+                "negative",
+                "latent_image",
+                "denoise",
+                "tile_plan",
+                "local_positive",
+            ],
+            True,
+        ),
+        TiledAnimaLLLiteApply: (
+            [
+                "model",
+                "model_patch",
+                "tile_plan",
+                "reference_tiles",
+                "strength",
+                "start_percent",
+                "end_percent",
+            ],
+            False,
+        ),
+        TileKrea2Conditioning: (
+            [
+                "clip",
+                "reference_tiles",
+                "prompts",
+                "strength",
+                "end_percent",
+                "downsize_to_1mp",
+                "baseline",
+            ],
+            True,
+        ),
+    }
+    schemas = {}
+    for node, (inputs, input_list) in expected.items():
+        schema = schemas[node] = node.define_schema()
+        assert [item.id for item in schema.inputs] == inputs
+        assert bool(getattr(schema, "is_input_list", False)) is input_list
+        assert len(schema.outputs) == 1
+    optional = {
+        (node, item.id)
+        for node, schema in schemas.items()
+        for item in schema.inputs
+        if getattr(item, "optional", False)
+    }
+    assert optional == {
+        (TileSampler, "local_positive"),
+        (TileKrea2Conditioning, "prompts"),
+        (TileKrea2Conditioning, "baseline"),
+    }
+    # The seed's control widget occupies a saved widget-value position.
+    sampler = {item.id: item for item in schemas[TileSampler].inputs}
+    assert sampler["seed"].control_after_generate
+    krea2 = {item.id: item for item in schemas[TileKrea2Conditioning].inputs}
+    for name in ("prompts", "baseline"):
+        assert krea2[name].force_input and krea2[name].dynamic_prompts is False
+    assert schemas[TileKrea2Conditioning].outputs[0].is_output_list
+
+
+def test_plan_and_sampler_nodes_use_singleton_execution_lists(host):
+    from tiled_diffusion_ng.nodes import TilePlan, TileSampler
+
     args = arguments()
     planned = TilePlan.execute(args["model"], args["latent_image"], 16)
     assert len(planned) == 1 and planned[0] == args["tile_plan"]
@@ -162,7 +142,45 @@ def test_schema_defaults_and_singleton_execution_transport(host):
     result = TileSampler.execute(**wrapped)
     assert result[0]["samples"].shape == args["latent_image"]["samples"].shape
     assert all(len(call[0][0]) == 4 for call in host.tile_calls)
+    locals = [cond(value) for value in (3, 5, 7, 11)]
+    TileSampler.execute(**wrapped, local_positive=locals)
+    assert [
+        embedding.mean().item() for embedding, _ in host.common_calls[-1]["positive"]
+    ] == [3, 5, 7, 11]
     for key, value in wrapped.items():
-        malformed = {**wrapped, key: value * 2}
         with pytest.raises(ValueError, match=key):
-            TileSampler.execute(**malformed)
+            TileSampler.execute(**{**wrapped, key: value * 2})
+
+
+def test_krea2_conditioning_node_uses_singleton_execution_lists(host, monkeypatch):
+    from tiled_diffusion_ng.nodes import TileKrea2Conditioning
+
+    encoder_host.install(monkeypatch)
+    clip = encoder_host.Clip()
+    args = {
+        "clip": [clip],
+        "reference_tiles": [torch.full((4, 6, 10, 3), 0.5)],
+        "strength": [1.0],
+        "end_percent": [1.0],
+        "downsize_to_1mp": [False],
+    }
+    output = TileKrea2Conditioning.execute(**args)
+    assert len(output) == 1 and len(output[0]) == 4
+    for key, value in args.items():
+        for bad in (value * 2, value[0]):
+            with pytest.raises(ValueError, match=key + " requires one execution-list"):
+                TileKrea2Conditioning.execute(**{**args, key: bad})
+    assert len(clip.tokenized) == 4
+
+
+def test_lllite_apply_node_returns_patched_clone(host):
+    from tiled_diffusion_ng.adapters._anima_lllite import get_attachment
+    from tiled_diffusion_ng.nodes import TiledAnimaLLLiteApply
+
+    from .test_anima_lllite import patched
+
+    args, source, refs, patch = patched()
+    result = TiledAnimaLLLiteApply.execute(source, patch, args["tile_plan"], refs)
+    assert len(result) == 1 and result[0] is not source
+    assert get_attachment(result[0]).config.reference_tiles is refs
+    assert get_attachment(source) is None

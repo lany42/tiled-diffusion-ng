@@ -50,10 +50,10 @@ RGBA inputs use their RGB channels. Source tensors are never modified.
 
 This removes the reviewed bfloat16-to-NumPy failure path. The
 [CPU regression tests](../tests/test_krea2_conditioning.py) exercise real PyTorch
-interpolation for all four dtypes, check fractional colors that an 8-bit round
-trip would lose, and verify source preservation. They separately cover resize
-dimensions, the disabled/small-image paths, cutoff zero, and RGB bounds.
-Native Qwen preprocessing and encoder precision remain host-owned.
+interpolation for bfloat16 and float64 inputs, check fractional colors that an
+8-bit round trip would lose, and verify source preservation. They separately
+cover resize dimensions, the disabled/small-image paths, cutoff zero, and RGB
+bounds. Native Qwen preprocessing and encoder precision remain host-owned.
 
 ## Other image paths in the pack
 
